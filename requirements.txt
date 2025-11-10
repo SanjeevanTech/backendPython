@@ -6,6 +6,7 @@ numpy==1.24.3               # Numerical operations for face embeddings
 scikit-learn==1.3.2         # Cosine similarity calculations
 requests==2.31.0            # HTTP requests for distance APIs
 python-dateutil==2.8.2      # Date/time utilities
+schedule==1.2.0             # Job scheduling for dynamic schedule manager
 
 # Face recognition library (OPTIONAL - for local development only)
 # Uncomment these for local face recognition testing:
