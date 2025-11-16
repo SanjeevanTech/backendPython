@@ -1628,71 +1628,6 @@ def update_board_heartbeat(bus_id, device_id, location, ip_address):
         traceback.print_exc()
         return False
 
-def get_all_buses_power_config():
-    """Get all bus power configurations"""
-    try:
-        # Add timeout to prevent hanging
-        configs = list(bus_tracker.power_configs.find({}, {"_id": 0}).max_time_ms(5000))
-        
-        # Convert to dict format and ensure datetime objects are ISO strings
-        result = {}
-        for config in configs:
-            bus_id = config['bus_id']
-            
-            # Convert datetime objects to ISO format strings
-            if 'last_updated' in config and isinstance(config['last_updated'], datetime):
-                config['last_updated'] = config['last_updated'].isoformat()
-            
-            # Fix and convert board data
-            if 'boards' in config:
-                fixed_boards = []
-                for i, board in enumerate(config['boards']):
-                    # Debug: Print board structure
-                    if i == 0:  # Only print first board to avoid spam
-                        print(f"🔍 Debug board structure for {bus_id}: {board} (type: {type(board)})")
-                    
-                    # Handle different board formats
-                    if isinstance(board, str):
-                        # Old format: boards was just an array of device IDs
-                        fixed_board = {
-                            'device_id': board,
-                            'location': 'Unknown',
-                            'ip_address': 'No IP',
-                            'last_seen': None
-                        }
-                    elif isinstance(board, dict):
-                        # New format: boards is array of objects
-                        fixed_board = {
-                            'device_id': board.get('device_id') or board.get('board_id') or 'Unknown',
-                            'location': board.get('location') or board.get('position') or 'Unknown',
-                            'ip_address': board.get('ip_address') or board.get('ip') or 'No IP',
-                            'last_seen': None
-                        }
-                        
-                        # Convert last_seen to ISO format
-                        if 'last_seen' in board:
-                            if isinstance(board['last_seen'], datetime):
-                                fixed_board['last_seen'] = board['last_seen'].isoformat()
-                            else:
-                                fixed_board['last_seen'] = board['last_seen']
-                    else:
-                        # Unknown format
-                        print(f"⚠️ Unknown board format: {type(board)}")
-                        continue
-                    
-                    fixed_boards.append(fixed_board)
-                
-                config['boards'] = fixed_boards
-            
-            result[bus_id] = config
-        
-        return result
-    except Exception as e:
-        print(f"❌ Error getting all power configs: {e}")
-        import traceback
-        traceback.print_exc()
-        return {}
-
 def delete_power_config(bus_id):
     """Delete power configuration for a bus"""
     try:
@@ -1738,13 +1673,28 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
         self.end_headers()
     
     def do_GET(self):
-        """Handle GET requests"""
+        """Handle GET requests - ESP32 ENDPOINTS ONLY"""
+        # Root status endpoint
         if self.path == '/' or self.path == '/status':
-            stats = bus_tracker.get_stats()
             response = {
                 'status': 'success',
-                'message': 'Bus Tracking System',
-                'stats': stats,
+                'message': '🚌 Python Backend - ESP32 Processing Engine Only',
+                'bus_id': bus_tracker.bus_id,
+                'route_name': bus_tracker.route_name,
+                'esp32_endpoints': {
+                    'GET': [
+                        '/api/health',
+                        '/api/trip-context',
+                        '/api/power-config'
+                    ],
+                    'POST': [
+                        '/api/entry-logs',
+                        '/api/exit-logs',
+                        '/api/board-heartbeat',
+                        '/api/extract-face-embedding'
+                    ]
+                },
+                'note': 'All frontend CRUD endpoints moved to Node.js backend (port 5000)',
                 'timestamp': datetime.now().isoformat()
             }
             self._send_json_response(response)
@@ -1841,241 +1791,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
             print(f"📍 Trip context: {response['trip_status']} | Auto: {response.get('auto_managed', False)}")
             self._send_json_response(response)
         
-        elif self.path == '/passengers':
-            # Get final passenger list - OPTIMIZED
-            try:
-                query_params = self._get_query_params()
-                limit = int(query_params.get('limit', [50])[0])
-                skip = int(query_params.get('skip', [0])[0])
-                trip_id = query_params.get('trip_id', [None])[0]
-                
-                query = {"bus_id": bus_tracker.bus_id}
-                if trip_id:
-                    query["trip_id"] = trip_id
-                
-                # OPTIMIZATION: Exclude large fields but keep is_season_ticket
-                projection = {
-                    "_id": 0,
-                    "face_embedding": 0,
-                    "season_ticket_info.valid_route": 0
-                }
-                
-                total = bus_tracker.final_passengers.count_documents(query)
-                passengers = list(bus_tracker.final_passengers.find(
-                    query, projection
-                ).sort("entry_timestamp", -1).skip(skip).limit(limit))
-                
-                # Ensure is_season_ticket field is present for frontend display
-                for passenger in passengers:
-                    if 'is_season_ticket' not in passenger:
-                        passenger['is_season_ticket'] = False
-                    # Debug log for season ticket members
-                    if passenger.get('is_season_ticket'):
-                        print(f"🎫 Season ticket member in response: {passenger.get('id')} - {passenger.get('season_ticket_info', {}).get('member_name', 'Unknown')}")
-                
-                self._send_json_response({
-                    'status': 'success',
-                    'total': total,
-                    'count': len(passengers),
-                    'limit': limit,
-                    'skip': skip,
-                    'passengers': passengers
-                })
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        elif self.path == '/unmatched':
-            # Get unmatched passenger list - OPTIMIZED
-            try:
-                query_params = self._get_query_params()
-                limit = int(query_params.get('limit', [50])[0])
-                skip = int(query_params.get('skip', [0])[0])
-                trip_id = query_params.get('trip_id', [None])[0]
-                
-                query = {"bus_id": bus_tracker.bus_id}
-                if trip_id:
-                    query["trip_id"] = trip_id
-                
-                total = bus_tracker.unmatched_passengers.count_documents(query)
-                unmatched = list(bus_tracker.unmatched_passengers.find(
-                    query, {"_id": 0, "face_embedding": 0}
-                ).sort("timestamp", -1).skip(skip).limit(limit))
-                
-                self._send_json_response({
-                    'status': 'success',
-                    'total': total,
-                    'count': len(unmatched),
-                    'limit': limit,
-                    'skip': skip,
-                    'unmatched_passengers': unmatched
-                })
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        elif self.path == '/temp':
-            # Get current temporary entries - OPTIMIZED
-            try:
-                query_params = self._get_query_params()
-                limit = int(query_params.get('limit', [100])[0])
-                
-                total = bus_tracker.temp_entries.count_documents({"bus_id": bus_tracker.bus_id})
-                temp_entries = list(bus_tracker.temp_entries.find(
-                    {"bus_id": bus_tracker.bus_id},
-                    {"_id": 0, "face_embedding": 0}
-                ).sort("entry_timestamp", -1).limit(limit))
-                
-                self._send_json_response({
-                    'status': 'success',
-                    'total': total,
-                    'count': len(temp_entries),
-                    'temp_entries': temp_entries
-                })
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        elif self.path == '/trip' or self.path == '/trip/current':
-            # Get current trip status
-            try:
-                current_trip = bus_tracker.get_current_trip()
-                self._send_json_response({
-                    'status': 'success',
-                    'current_trip': current_trip
-                })
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        elif self.path == '/trip/all':
-            # Get all recent trips - OPTIMIZED
-            try:
-                query_params = self._get_query_params()
-                limit = int(query_params.get('limit', [20])[0])
-                
-                projection = {"route_detection_gps": 0}
-                trips = list(bus_tracker.trip_sessions.find(
-                    {"bus_id": bus_tracker.bus_id}, projection
-                ).sort("start_time", -1).limit(limit))
-                
-                self._send_json_response({
-                    'status': 'success',
-                    'count': len(trips),
-                    'trips': trips
-                })
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        elif self.path == '/admin':
-            # Admin interface
-            self.send_response(200)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            
-            try:
-                with open('production/admin_schedule_interface.html', 'r') as f:
-                    html_content = f.read()
-                self.wfile.write(html_content.encode())
-            except FileNotFoundError:
-                self.wfile.write(b'<h1>Admin interface not found in production/ folder</h1>')
-        
-        elif self.path.startswith('/api/schedule'):
-            # Schedule management API - OPTIMIZED
-            try:
-                if self.path == '/api/schedule':
-                    schedule_data = schedule_manager.get_current_schedule_json()
-                    self._send_json_response(schedule_data)
-                
-                elif self.path == '/api/schedule/status':
-                    status = {
-                        "scheduler_running": schedule_manager.scheduler_running,
-                        "current_schedule_name": schedule_manager.current_schedule.get('schedule_name') if schedule_manager.current_schedule else None,
-                        "bus_id": schedule_manager.bus_id,
-                        "last_updated": schedule_manager.current_schedule.get('updated_at') if schedule_manager.current_schedule else None
-                    }
-                    self._send_json_response(status)
-                else:
-                    self._send_error_response('Invalid schedule endpoint', 404)
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        # ESP32 Smart Power Schedule Endpoint
-        elif self.path.startswith('/api/esp32/power-schedule/'):
-            try:
-                # Extract bus_id from path: /api/esp32/power-schedule/BUS_JC_001
-                bus_id = self.path.split('/')[-1]
-                
-                # Get power config from MongoDB
-                power_config = bus_tracker.power_configs.find_one({"bus_id": bus_id})
-                
-                if not power_config:
-                    response = {
-                        "status": "error",
-                        "message": "No config found",
-                        "fallback": {"trip_start": "00:00", "trip_end": "23:59"}
-                    }
-                else:
-                    # Get current time
-                    now = datetime.now()
-                    current_minutes = now.hour * 60 + now.minute
-                    
-                    # Check if smart power is enabled and trip_windows exist
-                    smart_enabled = power_config.get('smart_power_enabled', False)
-                    trip_windows = power_config.get('trip_windows', [])
-                    
-                    current_trip = None
-                    next_trip = None
-                    
-                    if smart_enabled and trip_windows:
-                        for window in trip_windows:
-                            start_h, start_m = map(int, window['start_time'].split(':'))
-                            end_h, end_m = map(int, window['end_time'].split(':'))
-                            start_min = start_h * 60 + start_m
-                            end_min = end_h * 60 + end_m
-                            
-                            # Check if currently in this trip
-                            if current_minutes >= start_min and current_minutes <= end_min:
-                                current_trip = window
-                            
-                            # Find next trip
-                            if current_minutes < start_min and not next_trip:
-                                next_trip = window
-                        
-                        # If no next trip today, use first trip tomorrow
-                        if not next_trip and trip_windows:
-                            next_trip = trip_windows[0]
-                    
-                    response = {
-                        "status": "success",
-                        "bus_id": bus_id,
-                        "smart_power_enabled": smart_enabled,
-                        "current_trip": current_trip,
-                        "next_trip": next_trip,
-                        "all_trip_windows": trip_windows,
-                        "fallback": {
-                            "trip_start": power_config.get('trip_start', '00:00'),
-                            "trip_end": power_config.get('trip_end', '23:59')
-                        },
-                        "timestamp": now.isoformat()
-                    }
-                
-                response_data = json.dumps(response).encode()
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Content-Length', str(len(response_data)))
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(response_data)
-                
-            except Exception as e:
-                print(f"❌ Error in ESP32 power schedule: {e}")
-                error_response = {'status': 'error', 'message': str(e)}
-                response_data = json.dumps(error_response).encode()
-                self.send_response(500)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Content-Length', str(len(response_data)))
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(response_data)
-        
-        # Power Management API Endpoints - OPTIMIZED
+        # ESP32 Power Config Endpoint
         elif self.path.startswith('/api/power-config'):
             try:
                 query_params = self._get_query_params()
@@ -2104,166 +1820,16 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_error_response(str(e))
         
-        elif self.path == '/api/buses':
-            # Get all buses power config - OPTIMIZED
-            try:
-                buses = get_all_buses_power_config()
-                self._send_json_response(buses)
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        elif self.path == '/api/buses/debug':
-            # Debug endpoint - OPTIMIZED
-            try:
-                raw_configs = list(bus_tracker.power_configs.find({}, {"_id": 0}).limit(10))
-                self._send_json_response({
-                    'status': 'debug',
-                    'count': len(raw_configs),
-                    'configs': raw_configs
-                })
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        elif self.path == '/api/season-tickets':
-            # Get all season ticket members - for debugging
-            try:
-                query_params = self._get_query_params()
-                include_embedding = query_params.get('include_embedding', ['false'])[0].lower() == 'true'
-                
-                projection = {"_id": 0}
-                if not include_embedding:
-                    projection["face_embedding"] = 0
-                
-                members = list(self.season_ticket_members.find({}, projection))
-                
-                # Convert datetime objects to ISO strings
-                for member in members:
-                    if 'valid_from' in member and isinstance(member['valid_from'], datetime):
-                        member['valid_from'] = member['valid_from'].isoformat()
-                    if 'valid_until' in member and isinstance(member['valid_until'], datetime):
-                        member['valid_until'] = member['valid_until'].isoformat()
-                    if 'last_used' in member and isinstance(member['last_used'], datetime):
-                        member['last_used'] = member['last_used'].isoformat()
-                    if 'created_at' in member and isinstance(member['created_at'], datetime):
-                        member['created_at'] = member['created_at'].isoformat()
-                
-                self._send_json_response({
-                    'status': 'success',
-                    'count': len(members),
-                    'members': members,
-                    'threshold': self.season_ticket_similarity_threshold
-                })
-            except Exception as e:
-                self._send_error_response(str(e))
-        
-        elif self.path == '/distance-stats':
-            # Get distance statistics
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            try:
-                # Get all passengers with distance info
-                passengers = list(bus_tracker.final_passengers.find(
-                    {"bus_id": bus_tracker.bus_id, "distance_info.success": True},
-                    {"distance_info": 1, "journey_duration_minutes": 1, "entry_timestamp": 1, "exit_timestamp": 1}
-                ))
-                
-                if passengers:
-                    distances = [p['distance_info']['distance_km'] for p in passengers if p.get('distance_info', {}).get('success')]
-                    durations = [p['journey_duration_minutes'] for p in passengers]
-                    
-                    total_distance = sum(distances)
-                    avg_distance = total_distance / len(distances) if distances else 0
-                    max_distance = max(distances) if distances else 0
-                    min_distance = min(distances) if distances else 0
-                    
-                    avg_duration = sum(durations) / len(durations) if durations else 0
-                    
-                    # Count by provider
-                    provider_stats = {}
-                    for p in passengers:
-                        provider = p.get('distance_info', {}).get('provider', 'unknown')
-                        provider_stats[provider] = provider_stats.get(provider, 0) + 1
-                    
-                    response = {
-                        'status': 'success',
-                        'bus_id': bus_tracker.bus_id,
-                        'route_name': bus_tracker.route_name,
-                        'total_journeys_with_distance': len(distances),
-                        'distance_statistics': {
-                            'total_km': round(total_distance, 2),
-                            'average_km': round(avg_distance, 2),
-                            'max_km': round(max_distance, 2),
-                            'min_km': round(min_distance, 2)
-                        },
-                        'duration_statistics': {
-                            'average_minutes': round(avg_duration, 1)
-                        },
-                        'provider_usage': provider_stats,
-                        'api_config': {
-                            'primary_provider': bus_tracker.distance_api_config['provider'],
-                            'fallback_enabled': bus_tracker.distance_api_config['fallback_to_haversine']
-                        }
-                    }
-                else:
-                    response = {
-                        'status': 'success',
-                        'message': 'No journeys with distance data found',
-                        'total_journeys_with_distance': 0
-                    }
-                
-                self.wfile.write(json.dumps(response, indent=2, default=str).encode())
-            except Exception as e:
-                error_response = {'status': 'error', 'message': str(e)}
-                self.wfile.write(json.dumps(error_response).encode())
-        
-        elif self.path.startswith('/trip/'):
-            # Trip management endpoints
-            action = self.path.split('/')[-1]
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            try:
-                if action == 'start':
-                    trip_id = bus_tracker.start_new_trip()
-                    current_trip = bus_tracker.get_current_trip()
-                    response = {
-                        'status': 'success',
-                        'action': 'trip_started',
-                        'trip_id': trip_id,
-                        'current_trip': current_trip,
-                        'message': f'New trip started: {trip_id}'
-                    }
-                
-                elif action == 'end':
-                    success = bus_tracker.end_current_trip()
-                    response = {
-                        'status': 'success' if success else 'error',
-                        'action': 'trip_ended',
-                        'message': 'Trip ended successfully' if success else 'Failed to end trip'
-                    }
-                
-                else:
-                    response = {'status': 'error', 'message': 'Invalid action'}
-                
-                self.wfile.write(json.dumps(response, indent=2).encode())
-            except Exception as e:
-                error_response = {'status': 'error', 'message': str(e)}
-                self.wfile.write(json.dumps(error_response).encode())
-        
+        # All other endpoints removed - use Node.js backend
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send_error_response('Endpoint not found. Use Node.js backend for frontend APIs.', 404)
     
     def do_POST(self):
-        """Handle POST requests"""
+        """Handle POST requests - ESP32 ENDPOINTS ONLY"""
         try:
             parsed_path = urlparse(self.path)
             
-            # Face Embedding Extraction Endpoint (for Season Ticket Registration)
+            # ESP32 Face Embedding Extraction Endpoint
             if parsed_path.path == '/api/extract-face-embedding':
                 content_length = int(self.headers.get('Content-Length', 0))
                 post_data = self.rfile.read(content_length)
@@ -2413,73 +1979,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(json.dumps(response, indent=2).encode())
             
-            elif parsed_path.path == '/api/schedule':
-                # Update schedule
-                content_length = int(self.headers.get('Content-Length', 0))
-                post_data = self.rfile.read(content_length)
-                
-                schedule_data = json.loads(post_data.decode('utf-8'))
-                
-                # Update schedule
-                success = schedule_manager.update_schedule(schedule_data, "admin")
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                
-                if success:
-                    response = {
-                        'status': 'success',
-                        'message': 'Schedule updated successfully and scheduler restarted'
-                    }
-                else:
-                    response = {
-                        'status': 'error',
-                        'message': 'Failed to update schedule'
-                    }
-                
-                self.wfile.write(json.dumps(response, indent=2).encode())
-            
-            # Power Management POST Endpoints
-            elif parsed_path.path == '/api/power-config':
-                content_length = int(self.headers.get('Content-Length', 0))
-                post_data = self.rfile.read(content_length)
-                
-                data = json.loads(post_data.decode('utf-8'))
-                bus_id = data.get('bus_id')
-                
-                if not bus_id:
-                    self.send_response(400)
-                    self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    response = {'status': 'error', 'message': 'bus_id required'}
-                    self.wfile.write(json.dumps(response).encode())
-                    return
-                
-                success = update_power_config(bus_id, data)
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                
-                if success:
-                    config = get_power_config(bus_id)
-                    response = {
-                        'success': True,
-                        'message': f'Configuration updated for {bus_id}',
-                        'config': config
-                    }
-                else:
-                    response = {
-                        'success': False,
-                        'message': 'Failed to update configuration'
-                    }
-                
-                self.wfile.write(json.dumps(response, indent=2, default=str).encode())
-            
+            # ESP32 Board Heartbeat Endpoint
             elif parsed_path.path == '/api/board-heartbeat':
                 content_length = int(self.headers.get('Content-Length', 0))
                 post_data = self.rfile.read(content_length)
@@ -2532,110 +2032,39 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
             error_response = {'status': 'error', 'message': str(e)}
             self.wfile.write(json.dumps(error_response).encode())
     
-    def do_DELETE(self):
-        """Handle DELETE requests"""
-        try:
-            parsed_path = urlparse(self.path)
-            
-            # Delete power config
-            if parsed_path.path == '/api/power-config':
-                # Get bus_id from query parameters
-                query_params = parse_qs(parsed_path.query)
-                bus_id = query_params.get('bus_id', [None])[0]
-                
-                if not bus_id:
-                    self.send_response(400)
-                    self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    response = {'status': 'error', 'message': 'bus_id required'}
-                    self.wfile.write(json.dumps(response).encode())
-                    return
-                
-                success = delete_power_config(bus_id)
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                
-                if success:
-                    response = {
-                        'success': True,
-                        'message': f'Power config deleted for {bus_id}'
-                    }
-                else:
-                    response = {
-                        'success': False,
-                        'message': f'No power config found for {bus_id}'
-                    }
-                
-                self.wfile.write(json.dumps(response, indent=2).encode())
-            
-            else:
-                self.send_response(404)
-                self.end_headers()
-                
-        except Exception as e:
-            print(f"❌ Error processing DELETE request: {e}")
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            error_response = {'status': 'error', 'message': str(e)}
-            self.wfile.write(json.dumps(error_response).encode())
+    # DELETE handler removed - Not needed for ESP32 endpoints
+    # All CRUD operations moved to Node.js backend
 
 def run_server(port=None):
-    """Run the simplified server with ESP32 integration"""
-    # Use environment variable PORT for production deployment (Render, Railway, etc.)
+    """Run the ESP32 processing backend"""
+    # Use environment variable PORT for production deployment
     if port is None:
         port = int(os.environ.get('PORT', 8888))
     
     server_address = ('0.0.0.0', port)  # Bind to 0.0.0.0 for external access
     httpd = HTTPServer(server_address, SimplifiedHandler)
     
-    print(f"\n🚌 Simplified Bus Passenger Tracking Server with ESP32 Integration")
+    print(f"\n{'='*70}")
+    print(f"🚌 Python Backend - ESP32 Processing Engine Only")
+    print(f"{'='*70}")
     print(f"📍 Bus: {bus_tracker.bus_id} ({bus_tracker.route_name})")
     print(f"🌐 Server running on port {port}")
-    print(f"📊 Status: http://localhost:{port}/status")
-    print(f"👥 Passengers: http://localhost:{port}/passengers")
-    print(f"❌ Unmatched: http://localhost:{port}/unmatched")
-    print(f"⏳ Temporary: http://localhost:{port}/temp")
-    print(f"📏 Distance Stats: http://localhost:{port}/distance-stats")
-    print(f"🚌 Trip Status: http://localhost:{port}/trip")
-    print(f"🎛️ ADMIN PANEL: http://localhost:{port}/admin")
-    print(f"📅 Schedule API: http://localhost:{port}/api/schedule")
-    print(f"▶️ Start Trip: http://localhost:{port}/trip/start")
-    print(f"⏹️ End Trip: http://localhost:{port}/trip/end")
-    print(f"\n⚡ POWER MANAGEMENT API:")
-    print(f"  📡 Get Config: http://localhost:{port}/api/power-config?bus_id=BUS_JC_001")
-    print(f"  📡 Update Config: http://localhost:{port}/api/power-config (POST)")
-    print(f"  📡 All Buses: http://localhost:{port}/api/buses")
-    print(f"  💓 Board Heartbeat: http://localhost:{port}/api/board-heartbeat (POST)")
-    print(f"\n🤖 ESP32 INTEGRATION ENDPOINTS:")
-    print(f"  📡 Health Check: http://your-ip:{port}/api/health")
-    print(f"  📍 Trip Context: http://your-ip:{port}/api/trip-context?bus_id=BUS_JC_001")
-    print(f"  💊 Device Health: http://your-ip:{port}/api/device-health (POST)")
-    print(f"  📡 ENTRY Logs: http://your-ip:{port}/api/entry-logs (POST)")
-    print(f"  📡 EXIT Logs: http://your-ip:{port}/api/exit-logs (POST)")
-    print(f"\n🎛️ DYNAMIC SCHEDULE MANAGEMENT:")
-    print(f"  ✅ No hard-coded times - Admin configurable")
-    print(f"  ✅ Web interface for schedule changes")
-    print(f"  ✅ Automatic scheduler restart on changes")
-    print(f"  ✅ Real-time schedule updates")
-    print(f"  ✅ Power management configuration")
-    print(f"\n📏 ROAD DISTANCE CALCULATION:")
-    print(f"  ✅ Primary: {bus_tracker.distance_api_config['provider'].upper()} API")
-    print(f"  ✅ Fallback: OSRM API (free, no key required)")
-    print(f"  ✅ Last resort: Haversine distance (straight-line)")
-    print(f"  ✅ Automatic journey distance tracking")
-    print(f"  ✅ Distance statistics and analytics")
-    print(f"\n🔧 ESP32 CONFIGURATION:")
-    print(f"  ✅ Update ESP32 server URL to: http://your-ip:{port}")
-    print(f"  ✅ Face detection logs automatically processed")
-    print(f"  ✅ Real-time passenger matching")
-    print(f"  ✅ MongoDB integration")
-    print(f"\nPress Ctrl+C to stop the server\n")
+    print(f"")
+    print(f"⚠️  ALL FRONTEND CRUD ENDPOINTS MOVED TO NODE.JS")
+    print(f"➡️  Use: http://localhost:5000/api/* (with authentication)")
+    print(f"")
+    print(f"🤖 ESP32 ENDPOINTS (6 total):")
+    print(f"")
+    print(f"1️⃣ GET  /api/trip-context - Trip info")
+    print(f"2️⃣ POST /api/entry-logs - Face entry")
+    print(f"3️⃣ POST /api/exit-logs - Face exit")
+    print(f"4️⃣ GET  /api/power-config - Power settings")
+    print(f"5️⃣ POST /api/board-heartbeat - Board status")
+    print(f"6️⃣ POST /api/extract-face-embedding - Face recognition (admin)")
+    print(f"")
+    print(f"{'='*70}")
+    print(f"Press Ctrl+C to stop the server")
+    print(f"{'='*70}\n")
     
     try:
         httpd.serve_forever()

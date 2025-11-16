@@ -51,3 +51,11 @@ face_embeddings.db
 uploads/
 temp/
 tmp/
+
+# Face recognition images (stored locally, not in git)
+images/temp/
+images/permanent/
+images/failed/
+*.jpg
+*.jpeg
+*.png
