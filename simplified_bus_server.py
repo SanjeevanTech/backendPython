@@ -196,31 +196,8 @@ class SimplifiedBusTracker:
             if self.current_trip and self.current_trip.get('status') == 'active':
                 self.end_current_trip()
             
-            # Safety cleanup: Move any orphaned temp_entries to unmatched
-            # (in case previous trip didn't end properly)
-            orphaned = self.temp_entries.count_documents({"bus_id": self.bus_id})
-            if orphaned > 0:
-                print(f"⚠️ Found {orphaned} orphaned temp_entries, cleaning up...")
-                orphaned_entries = list(self.temp_entries.find({"bus_id": self.bus_id}))
-                for entry in orphaned_entries:
-                    unmatched_entry = {
-                        "trip_id": entry.get('trip_id', 'UNKNOWN'),
-                        "bus_id": self.bus_id,
-                        "route_name": entry.get('route_name', self.route_name),
-                        "type": "ENTRY",
-                        "trip_start_time": entry.get('trip_start_time'),
-                        "face_id": entry.get('face_id', 0),
-                        "face_embedding": entry.get('face_embedding', []),
-                        "embedding_size": entry.get('embedding_size', 0),
-                        "location": entry.get('entry_location', {}),
-                        "timestamp": entry.get('entry_timestamp'),
-                        "best_similarity_found": 0.0,
-                        "reason": "Orphaned entry - cleaned up before new trip",
-                        "created_at": datetime.now()
-                    }
-                    self.unmatched_passengers.insert_one(unmatched_entry)
-                self.temp_entries.delete_many({"bus_id": self.bus_id})
-                print(f"✅ Cleaned up {orphaned} orphaned entries")
+            # Cleanup orphaned entries using existing method
+            self.cleanup_old_temp_entries(hours_old=0)  # Clean all old entries
             
             # Generate trip ID
             trip_id = self.generate_trip_id(start_time)
@@ -330,81 +307,38 @@ class SimplifiedBusTracker:
             print(f"❌ Error ending trip: {e}")
             return False
     
-    def get_current_route_info(self, current_time=None):
-        """Determine current route based on time of day"""
-        if current_time is None:
-            current_time = datetime.now().time()
-        
-        # Morning route: Jaffna → Colombo (6 AM - 6 PM)
-        if current_time >= datetime.strptime("06:00", "%H:%M").time() and current_time < datetime.strptime("18:00", "%H:%M").time():
-            return self.schedule["jaffna_to_colombo"]
-        
-        # Evening/Night route: Colombo → Jaffna (6 PM - 6 AM next day)
-        else:
-            return self.schedule["colombo_to_jaffna"]
-    
-    def is_departure_time(self, current_time=None, tolerance_minutes=30):
-        """Check if it's near departure time"""
-        if current_time is None:
-            current_time = datetime.now().time()
-        
-        for route_key, route_info in self.schedule.items():
-            departure_time = datetime.strptime(route_info["departure_time"], "%H:%M").time()
-            
-            # Convert to minutes for comparison
-            current_minutes = current_time.hour * 60 + current_time.minute
-            departure_minutes = departure_time.hour * 60 + departure_time.minute
-            
-            # Check tolerance window
-            time_diff = abs(current_minutes - departure_minutes)
-            
-            if time_diff <= tolerance_minutes:
-                return True, route_info
-        
-        return False, None
+    # Removed: get_current_route_info() - Replaced by DynamicScheduleManager
+    # Removed: is_departure_time() - Replaced by DynamicScheduleManager
     
     def get_current_trip(self):
-        """Get current trip information with schedule awareness"""
+        """Get current trip information"""
         if not self.current_trip:
-            # No active trip, check if it's departure time
-            is_departure, route_info = self.is_departure_time()
-            
             return {
                 'trip_id': None,
                 'bus_id': self.bus_id,
-                'route_name': route_info['route_name'] if route_info else self.route_name,
+                'route_name': self.route_name,
                 'status': 'waiting_for_departure',
-                'trip_active': is_departure,
-                'next_departure': route_info['departure_time'] if route_info else 'Unknown',
+                'trip_active': False,
                 'passengers_inside': 0,
                 'passengers_completed': 0,
                 'duration_minutes': 0
             }
         
         try:
-            # Get trip session from database
             trip_session = self.trip_sessions.find_one({"_id": self.current_trip['_id']})
             
             if trip_session:
-                # Count current passengers
                 passenger_count = self.final_passengers.count_documents({"trip_id": self.current_trip['trip_id']})
                 temp_count = self.temp_entries.count_documents({"trip_id": self.current_trip['trip_id']})
-                
-                # Calculate trip duration
                 duration_minutes = (datetime.now() - trip_session['start_time']).total_seconds() / 60
                 
-                # Determine trip status
-                route_info = self.get_current_route_info(trip_session['start_time'].time())
-                estimated_duration_minutes = route_info['estimated_duration_hours'] * 60
-                
+                # Simplified status
                 if duration_minutes < 60:
                     trip_status = "departing"
-                elif duration_minutes < estimated_duration_minutes - 60:
+                elif duration_minutes < 480:  # 8 hours
                     trip_status = "in_transit"
-                elif duration_minutes < estimated_duration_minutes + 180:  # +3 hours flexibility
-                    trip_status = "approaching_destination"
                 else:
-                    trip_status = "should_have_arrived"
+                    trip_status = "approaching_destination"
                 
                 return {
                     'trip_id': self.current_trip['trip_id'],
@@ -415,10 +349,7 @@ class SimplifiedBusTracker:
                     'trip_active': True,
                     'passengers_completed': passenger_count,
                     'passengers_inside': temp_count,
-                    'duration_minutes': round(duration_minutes, 1),
-                    'estimated_duration_minutes': estimated_duration_minutes,
-                    'departure_city': route_info['departure_city'],
-                    'destination_city': route_info['destination_city']
+                    'duration_minutes': round(duration_minutes, 1)
                 }
             return None
         except Exception as e:
@@ -495,94 +426,34 @@ class SimplifiedBusTracker:
             print(f"❌ Error with OSRM API: {e}")
             return None
     
-    def calculate_road_distance_openrouteservice(self, start_lat, start_lon, end_lat, end_lon):
-        """Calculate road distance using OpenRouteService API (requires API key)"""
-        try:
-            if not self.distance_api_config.get('openrouteservice_api_key'):
-                print("❌ OpenRouteService API key not configured")
-                return None
-            
-            url = self.distance_api_config['openrouteservice_base_url']
-            headers = {
-                'Authorization': self.distance_api_config['openrouteservice_api_key'],
-                'Content-Type': 'application/json'
-            }
-            
-            data = {
-                'coordinates': [[float(start_lon), float(start_lat)], [float(end_lon), float(end_lat)]],
-                'format': 'json'
-            }
-            
-            response = requests.post(url, json=data, headers=headers, timeout=self.distance_api_config['timeout'])
-            
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('routes'):
-                    route = result['routes'][0]
-                    distance_km = route['summary']['distance'] / 1000
-                    duration_seconds = route['summary']['duration']
-                    
-                    return {
-                        'distance_km': round(distance_km, 2),
-                        'duration_minutes': round(duration_seconds / 60, 1),
-                        'provider': 'openrouteservice',
-                        'success': True
-                    }
-            
-            print(f"❌ OpenRouteService API error: {response.status_code} - {response.text}")
-            return None
-            
-        except Exception as e:
-            print(f"❌ Error with OpenRouteService API: {e}")
-            return None
+    # Removed: calculate_road_distance_openrouteservice() - Unused, OSRM is default
     
     def calculate_road_distance(self, start_lat, start_lon, end_lat, end_lon):
-        """Calculate road distance using configured provider with fallback"""
+        """Calculate road distance using OSRM with Haversine fallback"""
         try:
-            # Validate coordinates
             if not all([start_lat, start_lon, end_lat, end_lon]):
-                print("❌ Invalid coordinates provided")
                 return None
             
-            # Convert to float and validate range
             start_lat, start_lon = float(start_lat), float(start_lon)
             end_lat, end_lon = float(end_lat), float(end_lon)
             
             if not (-90 <= start_lat <= 90 and -180 <= start_lon <= 180 and 
                     -90 <= end_lat <= 90 and -180 <= end_lon <= 180):
-                print("❌ Coordinates out of valid range")
                 return None
             
-            print(f"🗺️ Calculating road distance from ({start_lat}, {start_lon}) to ({end_lat}, {end_lon})")
+            # Try OSRM first
+            result = self.calculate_road_distance_osrm(start_lat, start_lon, end_lat, end_lon)
             
-            # Try primary provider
-            result = None
-            provider = self.distance_api_config.get('provider', 'osrm')
-            
-            if provider == 'osrm':
-                result = self.calculate_road_distance_osrm(start_lat, start_lon, end_lat, end_lon)
-            elif provider == 'openrouteservice':
-                result = self.calculate_road_distance_openrouteservice(start_lat, start_lon, end_lat, end_lon)
-            
-            # If primary provider fails, try OSRM as fallback
-            if not result and provider != 'osrm':
-                print("🔄 Trying OSRM as fallback...")
-                result = self.calculate_road_distance_osrm(start_lat, start_lon, end_lat, end_lon)
-            
-            # If all APIs fail, use Haversine distance as last resort
-            if not result and self.distance_api_config.get('fallback_to_haversine', True):
-                print("🔄 Using Haversine distance as fallback...")
+            # Fallback to Haversine if OSRM fails
+            if not result:
                 haversine_km = self.calculate_haversine_distance(start_lat, start_lon, end_lat, end_lon)
                 result = {
                     'distance_km': round(haversine_km, 2),
-                    'duration_minutes': round(haversine_km * 2, 1),  # Rough estimate: 30 km/h average
+                    'duration_minutes': round(haversine_km * 2, 1),
                     'provider': 'haversine_fallback',
                     'success': True,
-                    'note': 'Straight-line distance (APIs unavailable)'
+                    'note': 'Straight-line distance'
                 }
-            
-            if result:
-                print(f"✅ Distance calculated: {result['distance_km']} km ({result['duration_minutes']} min) via {result['provider']}")
             
             return result
             
@@ -782,117 +653,9 @@ class SimplifiedBusTracker:
             traceback.print_exc()
             return None, 0.0
     
-    def _get_nearby_stops(self, gps_location, bus_route, radius_km=10):
-        """
-        Get stops near the GPS location from the bus route
-        
-        Args:
-            gps_location: dict with latitude and longitude
-            bus_route: Route information
-            radius_km: Search radius in kilometers
-        
-        Returns:
-            list: Nearby stops with normalized names
-        """
-        try:
-            if not gps_location or not bus_route:
-                return []
-            
-            lat = gps_location.get('latitude')
-            lon = gps_location.get('longitude')
-            
-            if not lat or not lon:
-                return []
-            
-            # Get route from database
-            route = self.db['busRoutes'].find_one({'route_id': bus_route})
-            if not route or not route.get('stops'):
-                return []
-            
-            nearby_stops = []
-            
-            for stop in route['stops']:
-                stop_lat = stop.get('latitude')
-                stop_lon = stop.get('longitude')
-                
-                if not stop_lat or not stop_lon:
-                    continue
-                
-                # Calculate distance
-                distance = self.calculate_haversine_distance(lat, lon, stop_lat, stop_lon)
-                
-                if distance <= radius_km:
-                    # Add stop with normalized name variations
-                    stop_info = stop.copy()
-                    stop_info['name_variations'] = self._get_location_name_variations(stop.get('stop_name', ''))
-                    nearby_stops.append(stop_info)
-            
-            return nearby_stops
-            
-        except Exception as e:
-            print(f"❌ Error getting nearby stops: {e}")
-            return []
-    
-    def _get_location_name_variations(self, location_name):
-        """
-        Generate name variations for fuzzy matching
-        
-        Examples:
-        - "Jaffna Bus Stand" → ["jaffna", "jaffna bus stand"]
-        - "Colombo Fort" → ["colombo", "colombo fort", "fort"]
-        
-        Args:
-            location_name: Original location name
-        
-        Returns:
-            list: Name variations for matching
-        """
-        if not location_name:
-            return []
-        
-        variations = []
-        name_lower = location_name.lower().strip()
-        
-        # Add full name
-        variations.append(name_lower)
-        
-        # Add first word (main location)
-        first_word = name_lower.split()[0] if ' ' in name_lower else name_lower
-        if first_word not in variations:
-            variations.append(first_word)
-        
-        # Remove common suffixes
-        common_suffixes = [' bus stand', ' bus station', ' junction', ' town', ' city']
-        for suffix in common_suffixes:
-            if name_lower.endswith(suffix):
-                base_name = name_lower.replace(suffix, '').strip()
-                if base_name and base_name not in variations:
-                    variations.append(base_name)
-        
-        return variations
-    
-    def _location_matches(self, season_ticket_location, stop_name_variations):
-        """
-        Check if season ticket location matches any stop name variation
-        
-        Args:
-            season_ticket_location: Location from season ticket (e.g., "Jaffna")
-            stop_name_variations: List of stop name variations
-        
-        Returns:
-            bool: True if matches
-        """
-        if not season_ticket_location or not stop_name_variations:
-            return False
-        
-        ticket_location_lower = season_ticket_location.lower().strip()
-        
-        # Check if ticket location matches any variation
-        for variation in stop_name_variations:
-            if ticket_location_lower in variation or variation in ticket_location_lower:
-                return True
-        
-        return False
+    # Removed: _get_nearby_stops() - Never called
+    # Removed: _get_location_name_variations() - Never called
+    # Removed: _location_matches() - Never called
     
     def is_route_valid_for_season_ticket(self, member, entry_location, exit_location):
         """Check if journey is within season ticket valid routes using GPS-based detection"""
@@ -1315,25 +1078,22 @@ class SimplifiedBusTracker:
             return None
     
     def cleanup_old_temp_entries(self, hours_old=24):
-        """Move old temp entries to unmatched collection and clean up"""
+        """Move old temp entries to unmatched collection"""
         try:
             cutoff_time = datetime.now() - timedelta(hours=hours_old)
-            
-            # Find old temp entries
             old_entries = list(self.temp_entries.find({
                 "bus_id": self.bus_id,
                 "entry_timestamp": {"$lt": cutoff_time}
             }))
             
             if old_entries:
-                print(f"🧹 Found {len(old_entries)} old temp entries to cleanup")
-                
-                # Move to unmatched collection
                 for entry in old_entries:
                     unmatched_entry = {
+                        "trip_id": entry.get('trip_id', 'UNKNOWN'),
                         "bus_id": self.bus_id,
                         "route_name": self.route_name,
                         "type": "ENTRY",
+                        "trip_start_time": entry.get('trip_start_time'),
                         "face_id": entry.get('face_id', 0),
                         "face_embedding": entry.get('face_embedding', []),
                         "embedding_size": entry.get('embedding_size', 0),
@@ -1343,70 +1103,20 @@ class SimplifiedBusTracker:
                         "reason": f"No exit found within {hours_old} hours",
                         "created_at": datetime.now()
                     }
-                    
                     self.unmatched_passengers.insert_one(unmatched_entry)
                 
-                # Delete old temp entries
                 result = self.temp_entries.delete_many({
                     "bus_id": self.bus_id,
                     "entry_timestamp": {"$lt": cutoff_time}
                 })
                 
-                print(f"🗑️ Moved {len(old_entries)} old entries to unmatched collection")
-                print(f"🗑️ Deleted {result.deleted_count} old temp entries")
-                
+                print(f"🗑️ Cleaned up {result.deleted_count} old temp entries")
                 return len(old_entries)
             
             return 0
             
         except Exception as e:
             print(f"❌ Error during cleanup: {e}")
-            return 0
-
-    def cleanup_old_temp_entries_for_new_trip(self):
-        """Move ALL existing temp_entries to unmatched when starting new trip"""
-        try:
-            # Find all temp entries for this bus
-            old_entries = list(self.temp_entries.find({
-                "bus_id": self.bus_id
-            }))
-            
-            if old_entries:
-                print(f"🧹 NEW TRIP: Moving {len(old_entries)} temp entries to unmatched")
-                
-                # Move to unmatched collection
-                for entry in old_entries:
-                    unmatched_entry = {
-                        "trip_id": entry.get('trip_id', 'UNKNOWN'),
-                        "bus_id": self.bus_id,
-                        "route_name": self.route_name,
-                        "type": "ENTRY",
-                        "trip_start_time": entry.get('trip_start_time', datetime.now()),
-                        "face_id": entry.get('face_id', 0),
-                        "face_embedding": entry.get('face_embedding', []),
-                        "embedding_size": entry.get('embedding_size', 0),
-                        "location": entry['entry_location'],
-                        "timestamp": entry['entry_timestamp'],
-                        "best_similarity_found": 0.0,
-                        "reason": "New trip started - previous trip data",
-                        "created_at": datetime.now()
-                    }
-                    self.unmatched_passengers.insert_one(unmatched_entry)
-                
-                # Delete all temp entries
-                result = self.temp_entries.delete_many({
-                    "bus_id": self.bus_id
-                })
-                
-                print(f"🗑️ Moved {len(old_entries)} entries to unmatched for new trip")
-                print(f"🗑️ Deleted {result.deleted_count} temp entries")
-                
-                return len(old_entries)
-            else:
-                return 0
-                
-        except Exception as e:
-            print(f"❌ Error during new trip cleanup: {e}")
             return 0
 
     def is_within_trip_schedule(self, current_time_str, trip_start, trip_end):
@@ -1430,23 +1140,7 @@ class SimplifiedBusTracker:
             print(f"❌ Error parsing trip schedule: {e}")
             return False
     
-    def configure_distance_api(self, provider='osrm', openrouteservice_api_key=None):
-        """Configure distance calculation API"""
-        valid_providers = ['osrm', 'openrouteservice']
-        
-        if provider not in valid_providers:
-            print(f"❌ Invalid provider. Choose from: {valid_providers}")
-            return False
-        
-        self.distance_api_config['provider'] = provider
-        
-        if provider == 'openrouteservice' and openrouteservice_api_key:
-            self.distance_api_config['openrouteservice_api_key'] = openrouteservice_api_key
-            print(f"✅ Distance API configured: {provider} with API key")
-        else:
-            print(f"✅ Distance API configured: {provider}")
-        
-        return True
+    # Removed: configure_distance_api() - Never called, OSRM is hardcoded
     
     def get_stats(self):
         """Get current statistics"""
@@ -1548,100 +1242,9 @@ def update_power_config(bus_id, config_data):
         print(f"❌ Error updating power config: {e}")
         return False
 
-def update_board_heartbeat(bus_id, device_id, location, ip_address):
-    """Update board heartbeat in power config"""
-    try:
-        config = bus_tracker.power_configs.find_one({"bus_id": bus_id})
-        
-        if not config:
-            # Create default config if doesn't exist
-            get_power_config(bus_id)
-            config = bus_tracker.power_configs.find_one({"bus_id": bus_id})
-        
-        boards = config.get('boards', [])
-        
-        # Convert old format to new format
-        new_boards = []
-        board_found = False
-        
-        for board in boards:
-            # Handle different board formats
-            if isinstance(board, str):
-                # Format 1: board is just a device_id string
-                board_device_id = board
-            elif isinstance(board, dict):
-                # Format 2: board is dict with 'device_id' field
-                # Format 3: board is dict with 'board_id' field (old format)
-                board_device_id = board.get('device_id') or board.get('board_id')
-            else:
-                # Unknown format, skip
-                continue
-            
-            # Check if this is the board we're updating
-            if board_device_id == device_id:
-                # Update this board with new format
-                new_boards.append({
-                    'device_id': device_id,
-                    'location': location,
-                    'ip_address': ip_address,
-                    'last_seen': datetime.now()
-                })
-                board_found = True
-            else:
-                # Keep other boards, convert to new format if needed
-                if isinstance(board, str):
-                    new_boards.append({
-                        'device_id': board,
-                        'location': 'Unknown',
-                        'ip_address': 'No IP',
-                        'last_seen': None
-                    })
-                elif isinstance(board, dict):
-                    # Migrate old format to new format
-                    new_boards.append({
-                        'device_id': board.get('device_id') or board.get('board_id') or 'Unknown',
-                        'location': board.get('location') or board.get('board_name') or 'Unknown',
-                        'ip_address': board.get('ip_address') or 'No IP',
-                        'last_seen': board.get('last_seen')
-                    })
-        
-        # If board not found, add it
-        if not board_found:
-            new_boards.append({
-                'device_id': device_id,
-                'location': location,
-                'ip_address': ip_address,
-                'last_seen': datetime.now()
-            })
-        
-        # Update database with new format
-        bus_tracker.power_configs.update_one(
-            {"bus_id": bus_id},
-            {"$set": {"boards": new_boards}}
-        )
-        
-        print(f"✅ Board heartbeat updated: {device_id} @ {ip_address}")
-        return True
-    except Exception as e:
-        print(f"❌ Error updating board heartbeat: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+# Removed: update_board_heartbeat() - Not used by ESP32 hardware
 
-def delete_power_config(bus_id):
-    """Delete power configuration for a bus"""
-    try:
-        result = bus_tracker.power_configs.delete_one({"bus_id": bus_id})
-        
-        if result.deleted_count > 0:
-            print(f"✅ Power config deleted for {bus_id}")
-            return True
-        else:
-            print(f"⚠️ No power config found for {bus_id}")
-            return False
-    except Exception as e:
-        print(f"❌ Error deleting power config: {e}")
-        return False
+# Removed: delete_power_config() - Not exposed via API, unused
 
 class SimplifiedHandler(BaseHTTPRequestHandler):
     def _send_json_response(self, data, status_code=200):
@@ -1690,7 +1293,6 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                     'POST': [
                         '/api/entry-logs',
                         '/api/exit-logs',
-                        '/api/board-heartbeat',
                         '/api/extract-face-embedding'
                     ]
                 },
@@ -1979,46 +1581,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(json.dumps(response, indent=2).encode())
             
-            # ESP32 Board Heartbeat Endpoint
-            elif parsed_path.path == '/api/board-heartbeat':
-                content_length = int(self.headers.get('Content-Length', 0))
-                post_data = self.rfile.read(content_length)
-                
-                data = json.loads(post_data.decode('utf-8'))
-                bus_id = data.get('bus_id')
-                device_id = data.get('device_id')
-                location = data.get('location', 'unknown')
-                ip_address = data.get('ip_address', 'unknown')
-                
-                print(f"\n💓 Board Heartbeat Received:")
-                print(f"   Bus: {bus_id}")
-                print(f"   Device: {device_id}")
-                print(f"   Location: {location}")
-                print(f"   IP: {ip_address}")
-                
-                if not bus_id or not device_id:
-                    self.send_response(400)
-                    self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    response = {'status': 'error', 'message': 'bus_id and device_id required'}
-                    self.wfile.write(json.dumps(response).encode())
-                    return
-                
-                success = update_board_heartbeat(bus_id, device_id, location, ip_address)
-                
-                if success:
-                    print(f"   ✅ Heartbeat updated successfully")
-                else:
-                    print(f"   ❌ Failed to update heartbeat")
-                
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                
-                response = {'success': success}
-                self.wfile.write(json.dumps(response).encode())
+            # Removed: /api/board-heartbeat endpoint - Not used by ESP32 hardware
             
             else:
                 self.send_response(404)
@@ -2049,20 +1612,6 @@ def run_server(port=None):
     print(f"{'='*70}")
     print(f"📍 Bus: {bus_tracker.bus_id} ({bus_tracker.route_name})")
     print(f"🌐 Server running on port {port}")
-    print(f"")
-    print(f"⚠️  ALL FRONTEND CRUD ENDPOINTS MOVED TO NODE.JS")
-    print(f"➡️  Use: http://localhost:5000/api/* (with authentication)")
-    print(f"")
-    print(f"🤖 ESP32 ENDPOINTS (6 total):")
-    print(f"")
-    print(f"1️⃣ GET  /api/trip-context - Trip info")
-    print(f"2️⃣ POST /api/entry-logs - Face entry")
-    print(f"3️⃣ POST /api/exit-logs - Face exit")
-    print(f"4️⃣ GET  /api/power-config - Power settings")
-    print(f"5️⃣ POST /api/board-heartbeat - Board status")
-    print(f"6️⃣ POST /api/extract-face-embedding - Face recognition (admin)")
-    print(f"")
-    print(f"{'='*70}")
     print(f"Press Ctrl+C to stop the server")
     print(f"{'='*70}\n")
     
