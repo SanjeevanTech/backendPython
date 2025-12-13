@@ -88,10 +88,17 @@ class DynamicScheduleManager:
             "created_by": "system"
         }
         
-        # Insert default schedule
-        result = self.bus_schedules.insert_one(default_schedule)
-        print(f"✅ Created default schedule: {result.inserted_id}")
-        return default_schedule
+        # Insert or update default schedule
+        # Use update_one with upsert=True to avoid duplicate key errors if it already exists but was not found by filter
+        self.bus_schedules.update_one(
+            {"bus_id": self.bus_id},
+            {"$set": default_schedule},
+            upsert=True
+        )
+        # Fetch the inserted/updated document
+        saved_schedule = self.bus_schedules.find_one({"bus_id": self.bus_id})
+        print(f"✅ Created/Updated default schedule: {saved_schedule.get('_id')}")
+        return saved_schedule
     
     def load_schedule(self):
         """Load active schedule from database"""

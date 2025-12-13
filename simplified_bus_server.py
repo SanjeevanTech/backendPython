@@ -14,7 +14,7 @@ import time
 import numpy as np
 import requests
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from sklearn.metrics.pairwise import cosine_similarity
@@ -524,8 +524,8 @@ class SimplifiedBusTracker:
                 print(f"⚠️ Distance too short ({distance_km} km < 100m), setting price to 0")
                 return 0.0
             
-            # Calculate stage number (3.5 km per stage)
-            STAGE_DISTANCE = 3.5
+            # Calculate stage number (2 km per stage - official Sri Lankan bus fare system)
+            STAGE_DISTANCE = 2.0
             stage_number = math.ceil(distance_km / STAGE_DISTANCE)
             
             # Fetch fare from fareStages collection
@@ -914,7 +914,7 @@ class SimplifiedBusTracker:
                     distance_km = distance_info.get('distance_km', 0) if distance_info else 0
                     price = self.calculate_fare(distance_km)
                 
-                stage_number = math.ceil(distance_info.get('distance_km', 0) / 3.5) if distance_info and distance_info.get('distance_km', 0) > 0 else 0
+                stage_number = math.ceil(distance_info.get('distance_km', 0) / 2.0) if distance_info and distance_info.get('distance_km', 0) > 0 else 0
                 
                 # Reverse geocode locations to get place names
                 entry_location_name = self.reverse_geocode(
@@ -1414,6 +1414,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                         "trip_windows": config.get('trip_windows', []),
                         "maintenance_interval": config.get('maintenance_interval', 5),
                         "maintenance_duration": config.get('maintenance_duration', 3),
+                        "boards": config.get('boards', []),
                         "last_updated": config['last_updated'].isoformat() if isinstance(config.get('last_updated'), datetime) else config.get('last_updated')
                     }
                     self._send_json_response(response)
@@ -1581,8 +1582,77 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(json.dumps(response, indent=2).encode())
             
-            # Removed: /api/board-heartbeat endpoint - Not used by ESP32 hardware
-            
+            # ESP32 Board Heartbeat - Restored (Required for POWER_SYNC)
+            elif parsed_path.path == '/api/board-heartbeat':
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length)
+                
+                try:
+                    data = json.loads(post_data.decode('utf-8'))
+                    device_id = data.get('device_id', 'UNKNOWN')
+                    # Use provided bus_id or default to tracking bus
+                    target_bus_id = data.get('bus_id', bus_tracker.bus_id)
+                    
+                    print(f"💓 Heartbeat received from {device_id} (Bus: {target_bus_id})")
+                    
+                    # Update DB with board status
+                    try:
+                        client_ip = self.client_address[0]
+                        device_type = 'ENTRANCE' if 'ENTRANCE' in device_id.upper() else 'EXIT'
+                        
+                        # Use UTC time for consistent timezone handling
+                        utc_now = datetime.now(timezone.utc)
+                        
+                        # 1. Try to update existing board in the array
+                        result = bus_tracker.power_configs.update_one(
+                            {"bus_id": target_bus_id, "boards.device_id": device_id},
+                            {
+                                "$set": {
+                                    "boards.$.last_seen": utc_now,
+                                    "boards.$.status": "online",
+                                    "boards.$.ip_address": client_ip,
+                                    "boards.$.location": device_type,
+                                    "updated_at": utc_now
+                                }
+                            }
+                        )
+                        
+                        # 2. If not found (matched_count == 0), push new board
+                        if result.matched_count == 0:
+                            print(f"➕ Registering new board: {device_id}")
+                            bus_tracker.power_configs.update_one(
+                                {"bus_id": target_bus_id},
+                                {
+                                    "$push": {
+                                        "boards": {
+                                            "device_id": device_id,
+                                            "location": device_type,
+                                            "ip_address": client_ip,
+                                            "last_seen": utc_now,
+                                            "status": "online",
+                                            "added_at": utc_now
+                                        }
+                                    },
+                                    "$set": {"updated_at": utc_now}
+                                },
+                                upsert=True
+                            )
+                            
+                    except Exception as db_err:
+                        print(f"⚠️ Failed to update board status in DB: {db_err}")
+
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    response = {"status": "success", "timestamp": datetime.now().isoformat()}
+                    self.wfile.write(json.dumps(response).encode())
+                    return
+                except Exception as e:
+                    print(f"❌ Error processing heartbeat: {e}")
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+
             else:
                 self.send_response(404)
                 self.end_headers()
