@@ -40,47 +40,19 @@ class SimplifiedBusTracker:
         self.power_configs = None     # Power management configurations per bus
         self.season_ticket_members = None  # Season ticket members collection
         
-        # Configuration for single bus
-        self.bus_id = "BUS_JC_001"
+        # Configuration - MULTI-BUS SUPPORT
+        self.default_bus_id = "BUS_JC_001"  # Default bus if none specified
         self.route_name = "Jaffna-Colombo"  # Will be updated automatically
         self.similarity_threshold = 0.7
         self.season_ticket_similarity_threshold = 0.65  # Lower threshold for ESP32 face variations
         self.time_window_hours = 48  # Increased to 48 hours for testing
         
-        # Simple prototype schedule system
-        self.schedule = {
-            "jaffna_to_colombo": {
-                "route_name": "Jaffna-Colombo",
-                "departure_time": "07:00",    # 7:00 AM (FIXED)
-                "departure_city": "Jaffna",
-                "destination_city": "Colombo",
-                "estimated_duration_hours": 8
-            },
-            "colombo_to_jaffna": {
-                "route_name": "Colombo-Jaffna", 
-                "departure_time": "18:00",    # 6:00 PM (FIXED)
-                "departure_city": "Colombo",
-                "destination_city": "Jaffna",
-                "estimated_duration_hours": 8
-            }
-        }
-        
-        # Trip session management
-        self.current_trip = None  # Current active trip
+        # Trip session management - MULTI-BUS SUPPORT
+        self.current_trips = {}  # Dict: bus_id -> current_trip (supports multiple buses)
         self.trip_sessions = None  # Collection to store trip sessions
         
         # Route detection
         self.route_detector = None  # Will be initialized after database connection
-        
-        # Distance calculation configuration
-        self.distance_api_config = {
-            'provider': 'osrm',  # Options: 'osrm', 'openrouteservice', 'mapbox'
-            'osrm_base_url': 'http://router.project-osrm.org/route/v1/driving',
-            'openrouteservice_api_key': None,  # Set your API key if using ORS
-            'openrouteservice_base_url': 'https://api.openrouteservice.org/v2/directions/driving-car',
-            'timeout': 10,
-            'fallback_to_haversine': True
-        }
         
         self.init_database()
     
@@ -107,8 +79,9 @@ class SimplifiedBusTracker:
             self.season_ticket_members.create_index([("member_id", 1)], unique=True)
             self.season_ticket_members.create_index([("is_active", 1), ("valid_from", 1), ("valid_until", 1)])
             
-            print("✅ Connected to MongoDB - Simplified Bus Tracking")
-            print(f"🚌 Tracking Bus: {self.bus_id} ({self.route_name})")
+            print("✅ Connected to MongoDB - Multi-Bus Tracking Enabled")
+            print(f"🚌 Default Bus: {self.default_bus_id} ({self.route_name})")
+            print(f"🔄 Multi-bus: Trips are created per bus_id from ESP32 requests")
             print(f"📊 Collections: temp_entries, busPassengerList, unmatchedPassengers, tripSessions, seasonTicketMembers")
             
             # Initialize route detector
@@ -119,20 +92,21 @@ class SimplifiedBusTracker:
                 print(f"⚠️ Route detector initialization failed: {e}")
                 self.route_detector = None
             
-            # Load or create current trip
-            self.load_current_trip()
+            # Don't auto-load trip on startup - trips are created on-demand per bus
             
         except Exception as e:
             print(f"❌ Failed to connect to MongoDB: {e}")
             raise
     
-    def generate_trip_id(self, start_time=None):
-        """Generate unique trip ID"""
+    def generate_trip_id(self, start_time=None, bus_id=None):
+        """Generate unique trip ID for a specific bus"""
         if start_time is None:
             start_time = datetime.now()
+        if bus_id is None:
+            bus_id = self.default_bus_id
         date_str = start_time.strftime('%Y-%m-%d')
         time_str = start_time.strftime('%H:%M')
-        return f"{self.bus_id}_{date_str}_{time_str}"
+        return f"{bus_id}_{date_str}_{time_str}"
     
     def _parse_timestamp_safe(self, timestamp_str):
         """Safely parse timestamp, handling invalid/epoch timestamps from ESP32"""
@@ -162,58 +136,69 @@ class SimplifiedBusTracker:
             print(f"⚠️ Error parsing timestamp '{timestamp_str}': {e}, using server time")
             return datetime.now()
     
-    def load_current_trip(self):
-        """Load active trip from database or create new one"""
+    def load_current_trip(self, bus_id=None):
+        """Load active trip from database for specific bus or create new one"""
+        if bus_id is None:
+            bus_id = self.default_bus_id
         try:
-            # Find active trip
+            # Find active trip for this bus
             active_trip = self.trip_sessions.find_one({
-                "bus_id": self.bus_id,
+                "bus_id": bus_id,
                 "status": "active"
             })
             
             if active_trip:
-                self.current_trip = {
+                self.current_trips[bus_id] = {
                     'trip_id': active_trip['trip_id'],
+                    'bus_id': bus_id,
                     'start_time': active_trip['start_time'],
                     'status': 'active',
                     '_id': active_trip['_id']
                 }
-                print(f"📍 Loaded active trip: {self.current_trip['trip_id']}")
+                print(f"📍 Loaded active trip for {bus_id}: {active_trip['trip_id']}")
             else:
-                # Auto-start new trip
-                self.start_new_trip()
+                # Auto-start new trip for this bus
+                self.start_new_trip(bus_id=bus_id)
         except Exception as e:
-            print(f"❌ Error loading trip: {e}")
-            self.start_new_trip()
+            print(f"❌ Error loading trip for {bus_id}: {e}")
+            self.start_new_trip(bus_id=bus_id)
     
-    def start_new_trip(self, start_time=None, initial_gps=None):
-        """Start a new trip session with smart route detection"""
+    def get_current_trip_for_bus(self, bus_id):
+        """Get or create current trip for a specific bus"""
+        if bus_id not in self.current_trips:
+            self.load_current_trip(bus_id)
+        return self.current_trips.get(bus_id)
+    
+    def start_new_trip(self, start_time=None, initial_gps=None, bus_id=None):
+        """Start a new trip session with smart route detection for specific bus"""
+        if bus_id is None:
+            bus_id = self.default_bus_id
         try:
             if start_time is None:
                 start_time = datetime.now()
             
-            # End previous trip if exists
-            if self.current_trip and self.current_trip.get('status') == 'active':
-                self.end_current_trip()
+            # End previous trip for this bus if exists
+            if bus_id in self.current_trips and self.current_trips[bus_id].get('status') == 'active':
+                self.end_current_trip(bus_id=bus_id)
             
-            # Cleanup orphaned entries using existing method
-            self.cleanup_old_temp_entries(hours_old=0)  # Clean all old entries
+            # Cleanup orphaned entries for this bus
+            self.cleanup_old_temp_entries(hours_old=0, bus_id=bus_id)
             
             # Generate trip ID
-            trip_id = self.generate_trip_id(start_time)
+            trip_id = self.generate_trip_id(start_time, bus_id)
             
             # Smart route detection based on GPS
             detected_route = self.route_name  # Default
-            if initial_gps and hasattr(self, 'route_detector'):
-                route_info = self.route_detector.detect_route_direction(self.bus_id, initial_gps, start_time)
+            if initial_gps and hasattr(self, 'route_detector') and self.route_detector:
+                route_info = self.route_detector.detect_route_direction(bus_id, initial_gps, start_time)
                 if route_info:
                     detected_route = route_info['route_name']
-                    print(f"🛣️ Auto-detected route: {detected_route}")
+                    print(f"🛣️ Auto-detected route for {bus_id}: {detected_route}")
             
             # Create trip session record
             trip_session = {
                 'trip_id': trip_id,
-                'bus_id': self.bus_id,
+                'bus_id': bus_id,
                 'route_name': detected_route,
                 'start_time': start_time,
                 'end_time': None,
@@ -226,28 +211,32 @@ class SimplifiedBusTracker:
             
             result = self.trip_sessions.insert_one(trip_session)
             
-            # Store current trip info
-            self.current_trip = {
+            # Store current trip info for this bus
+            self.current_trips[bus_id] = {
                 'trip_id': trip_id,
+                'bus_id': bus_id,
                 'start_time': start_time,
                 'status': 'active',
                 '_id': result.inserted_id
             }
             
-            print(f"🚌 Started new trip: {trip_id}")
+            print(f"🚌 Started new trip for {bus_id}: {trip_id}")
             return trip_id
         except Exception as e:
-            print(f"❌ Error starting trip: {e}")
+            print(f"❌ Error starting trip for {bus_id}: {e}")
             return None
     
-    def end_current_trip(self):
-        """End current trip and move unmatched to unmatched collection"""
+    def end_current_trip(self, bus_id=None):
+        """End current trip for specific bus and move unmatched to unmatched collection"""
+        if bus_id is None:
+            bus_id = self.default_bus_id
         try:
-            if not self.current_trip:
-                print("❌ No active trip")
+            current_trip = self.current_trips.get(bus_id)
+            if not current_trip:
+                print(f"❌ No active trip for {bus_id}")
                 return False
             
-            trip_id = self.current_trip['trip_id']
+            trip_id = current_trip['trip_id']
             
             # Count passengers for this trip
             passenger_count = self.final_passengers.count_documents({"trip_id": trip_id})
@@ -255,19 +244,19 @@ class SimplifiedBusTracker:
             # Move remaining temp_entries to unmatched (ENTRY type - no exit found)
             remaining = list(self.temp_entries.find({
                 "trip_id": trip_id,
-                "bus_id": self.bus_id
+                "bus_id": bus_id
             }))
             
-            print(f"🔍 Found {len(remaining)} unmatched ENTRY records in temp_entries")
+            print(f"🔍 Found {len(remaining)} unmatched ENTRY records for {bus_id}")
             
             unmatched_count = 0
             for entry in remaining:
                 unmatched_entry = {
                     "trip_id": trip_id,
-                    "bus_id": self.bus_id,
+                    "bus_id": bus_id,
                     "route_name": entry.get('route_name', self.route_name),
                     "type": "ENTRY",  # These are ENTRY faces that never got an EXIT match
-                    "trip_start_time": self.current_trip['start_time'],
+                    "trip_start_time": current_trip['start_time'],
                     "face_id": entry.get('face_id', 0),
                     "face_embedding": entry.get('face_embedding', []),
                     "embedding_size": entry.get('embedding_size', 0),
@@ -287,7 +276,7 @@ class SimplifiedBusTracker:
             
             # Update trip session
             self.trip_sessions.update_one(
-                {"_id": self.current_trip['_id']},
+                {"_id": current_trip['_id']},
                 {
                     "$set": {
                         "status": "completed",
@@ -298,24 +287,29 @@ class SimplifiedBusTracker:
                 }
             )
             
-            print(f"✅ Ended trip: {trip_id}")
+            print(f"✅ Ended trip for {bus_id}: {trip_id}")
             print(f"   Passengers: {passenger_count}, Unmatched: {unmatched_count}")
             
-            self.current_trip = None
+            # Remove from current trips
+            del self.current_trips[bus_id]
             return True
         except Exception as e:
-            print(f"❌ Error ending trip: {e}")
+            print(f"❌ Error ending trip for {bus_id}: {e}")
             return False
     
     # Removed: get_current_route_info() - Replaced by DynamicScheduleManager
     # Removed: is_departure_time() - Replaced by DynamicScheduleManager
     
-    def get_current_trip(self):
-        """Get current trip information"""
-        if not self.current_trip:
+    def get_current_trip(self, bus_id=None):
+        """Get current trip information for specific bus"""
+        if bus_id is None:
+            bus_id = self.default_bus_id
+        
+        current_trip = self.current_trips.get(bus_id)
+        if not current_trip:
             return {
                 'trip_id': None,
-                'bus_id': self.bus_id,
+                'bus_id': bus_id,
                 'route_name': self.route_name,
                 'status': 'waiting_for_departure',
                 'trip_active': False,
@@ -325,11 +319,11 @@ class SimplifiedBusTracker:
             }
         
         try:
-            trip_session = self.trip_sessions.find_one({"_id": self.current_trip['_id']})
+            trip_session = self.trip_sessions.find_one({"_id": current_trip['_id']})
             
             if trip_session:
-                passenger_count = self.final_passengers.count_documents({"trip_id": self.current_trip['trip_id']})
-                temp_count = self.temp_entries.count_documents({"trip_id": self.current_trip['trip_id']})
+                passenger_count = self.final_passengers.count_documents({"trip_id": current_trip['trip_id']})
+                temp_count = self.temp_entries.count_documents({"trip_id": current_trip['trip_id']})
                 duration_minutes = (datetime.now() - trip_session['start_time']).total_seconds() / 60
                 
                 # Simplified status
@@ -341,8 +335,8 @@ class SimplifiedBusTracker:
                     trip_status = "approaching_destination"
                 
                 return {
-                    'trip_id': self.current_trip['trip_id'],
-                    'bus_id': self.bus_id,
+                    'trip_id': current_trip['trip_id'],
+                    'bus_id': bus_id,
                     'route_name': trip_session.get('route_name', self.route_name),
                     'start_time': trip_session['start_time'].isoformat(),
                     'status': trip_status,
@@ -353,15 +347,17 @@ class SimplifiedBusTracker:
                 }
             return None
         except Exception as e:
-            print(f"❌ Error getting trip: {e}")
+            print(f"❌ Error getting trip for {bus_id}: {e}")
             return None
     
-    def get_all_trips(self, limit=10):
-        """Get recent trips"""
+    def get_all_trips(self, limit=10, bus_id=None):
+        """Get recent trips for specific bus or all buses"""
         try:
-            trips = list(self.trip_sessions.find({
-                "bus_id": self.bus_id
-            }).sort("start_time", -1).limit(limit))
+            query = {}
+            if bus_id:
+                query["bus_id"] = bus_id
+            
+            trips = list(self.trip_sessions.find(query).sort("start_time", -1).limit(limit))
             
             return trips
         except Exception as e:
@@ -732,12 +728,17 @@ class SimplifiedBusTracker:
             return False, None
     
     def store_entry(self, log_entry):
-        """Store temporary entry for matching"""
+        """Store temporary entry for matching - supports multiple buses"""
         try:
-            # Ensure we have an active trip
-            if not self.current_trip or self.current_trip.get('status') != 'active':
-                print("⚠️ No active trip, starting new trip...")
-                self.start_new_trip()
+            # Get bus_id from log entry, fallback to default
+            bus_id = log_entry.get('bus_id', self.default_bus_id)
+            
+            # Ensure we have an active trip for this bus
+            current_trip = self.get_current_trip_for_bus(bus_id)
+            if not current_trip or current_trip.get('status') != 'active':
+                print(f"⚠️ No active trip for {bus_id}, starting new trip...")
+                self.start_new_trip(bus_id=bus_id)
+                current_trip = self.current_trips.get(bus_id)
             
             # Check if this is a season ticket member at entry
             # OPTIMIZED: Pass route and GPS for targeted checking
@@ -747,7 +748,7 @@ class SimplifiedBusTracker:
             }
             season_member, season_similarity = self.check_season_ticket_member(
                 log_entry.get('face_embedding', []),
-                bus_route=self.current_trip.get('trip_id'),  # Use trip_id as route identifier
+                bus_route=current_trip.get('trip_id'),  # Use trip_id as route identifier
                 gps_location=gps_location
             )
             
@@ -758,17 +759,17 @@ class SimplifiedBusTracker:
                     "member_name": season_member['name'],
                     "similarity_score": float(season_similarity)
                 }
-                print(f"🎫 Season ticket member detected at ENTRY: {season_member['name']}")
+                print(f"🎫 Season ticket member detected at ENTRY on {bus_id}: {season_member['name']}")
             
             temp_entry = {
-                "trip_id": self.current_trip['trip_id'],  # NEW!
-                "trip_start_time": self.current_trip['start_time'],  # NEW!
-                "bus_id": self.bus_id,
+                "trip_id": current_trip['trip_id'],
+                "trip_start_time": current_trip['start_time'],
+                "bus_id": bus_id,  # Use bus_id from request
                 "route_name": self.route_name,
                 "face_id": log_entry.get('face_id', 0),
                 "face_embedding": log_entry.get('face_embedding', []),
                 "embedding_size": log_entry.get('embedding_size', 0),
-                "season_ticket_detected": season_ticket_detected,  # NEW!
+                "season_ticket_detected": season_ticket_detected,
                 "entry_location": {
                     "latitude": log_entry.get('latitude', 0),
                     "longitude": log_entry.get('longitude', 0),
@@ -780,39 +781,56 @@ class SimplifiedBusTracker:
             }
             
             result = self.temp_entries.insert_one(temp_entry)
-            print(f"✅ Stored temporary entry: {result.inserted_id} (Trip: {self.current_trip['trip_id']})")
+            print(f"✅ Stored entry for {bus_id}: {result.inserted_id} (Trip: {current_trip['trip_id']})")
             return str(result.inserted_id)
             
         except Exception as e:
             print(f"❌ Error storing entry: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def find_matching_entry(self, exit_log):
-        """Find matching entry and create final passenger record"""
+        """Find matching entry and create final passenger record - supports multiple buses"""
         if not exit_log.get('face_embedding'):
             return None, 0.0
         
         try:
-            # Ensure we have an active trip
-            if not self.current_trip or self.current_trip.get('status') != 'active':
-                print("⚠️ No active trip for exit matching")
+            # Get bus_id from exit log, fallback to default
+            bus_id = exit_log.get('bus_id', self.default_bus_id)
+            
+            # Ensure we have an active trip for this bus
+            current_trip = self.get_current_trip_for_bus(bus_id)
+            if not current_trip or current_trip.get('status') != 'active':
+                print(f"⚠️ No active trip for {bus_id} for exit matching")
                 return None, 0.0
             
-            # Get recent unmatched entries for CURRENT TRIP ONLY
+            # Calculate time threshold for matching window
             time_threshold = datetime.now() - timedelta(hours=self.time_window_hours)
             
-            unmatched_entries = self.temp_entries.find({
-                "trip_id": self.current_trip['trip_id'],  # NEW! Only match within same trip
-                "bus_id": self.bus_id,
+            # Build query - MUST filter by bus_id to only match entries from this bus
+            query = {
+                "trip_id": current_trip['trip_id'],  # Only match within same trip
+                "bus_id": bus_id,  # CRITICAL: Only match entries from this bus!
                 "entry_timestamp": {"$gte": time_threshold},
                 "face_embedding": {"$exists": True, "$ne": []}
-            }).sort("entry_timestamp", -1)
+            }
+            
+            # DEBUG: Print query to verify bus_id filtering
+            print(f"🔎 Query for matching: bus_id={bus_id}, trip_id={current_trip['trip_id']}")
+            
+            unmatched_entries = self.temp_entries.find(query).sort("entry_timestamp", -1)
             
             entries_list = list(unmatched_entries)
-            print(f"🔍 After filtering: Found {len(entries_list)} entries matching criteria")
+            print(f"🔍 Found {len(entries_list)} entries for {bus_id} (Trip: {current_trip['trip_id']})")
+            
+            # DEBUG: Show which bus_ids are in the results
+            if entries_list:
+                found_bus_ids = set(e.get('bus_id', 'UNKNOWN') for e in entries_list)
+                print(f"   Bus IDs in results: {found_bus_ids}")
             
             if not entries_list:
-                print(f"❌ No unmatched entries found for bus {self.bus_id}")
+                print(f"❌ No unmatched entries found for bus {bus_id}")
                 print(f"   Time threshold: {time_threshold}")
                 return None, 0.0
             
@@ -862,7 +880,7 @@ class SimplifiedBusTracker:
                 }
                 season_member, season_similarity = self.check_season_ticket_member(
                     exit_log['face_embedding'],
-                    bus_route=self.current_trip.get('trip_id'),
+                    bus_route=current_trip.get('trip_id'),
                     gps_location=exit_gps_location
                 )
                 
@@ -928,9 +946,9 @@ class SimplifiedBusTracker:
                 
                 final_passenger = {
                     "id": passenger_id,
-                    "trip_id": self.current_trip['trip_id'],  # NEW!
-                    "trip_start_time": self.current_trip['start_time'],  # NEW!
-                    "bus_id": self.bus_id,
+                    "trip_id": current_trip['trip_id'],
+                    "trip_start_time": current_trip['start_time'],
+                    "bus_id": bus_id,  # Use bus_id from request
                     "route_name": self.route_name,
                     "is_season_ticket": is_season_ticket,
                     "season_ticket_info": season_ticket_info,
@@ -986,8 +1004,9 @@ class SimplifiedBusTracker:
             return None, 0.0
     
     def process_face_log(self, log_entry):
-        """Process incoming face log entry"""
+        """Process incoming face log entry - supports multiple buses"""
         location_type = log_entry.get('location_type', '').upper()
+        bus_id = log_entry.get('bus_id', self.default_bus_id)
         
         if location_type == 'ENTRY':
             # Store temporary entry
@@ -997,13 +1016,14 @@ class SimplifiedBusTracker:
                 return {
                     'action': 'stored_entry',
                     'entry_id': entry_id,
-                    'bus_id': self.bus_id,
+                    'bus_id': bus_id,  # Use bus_id from request
                     'face_id': log_entry.get('face_id', 0),
-                    'message': f'Entry stored temporarily for matching (face_id: {log_entry.get("face_id", 0)})'
+                    'message': f'Entry stored for {bus_id} (face_id: {log_entry.get("face_id", 0)})'
                 }
             else:
                 return {
                     'action': 'error',
+                    'bus_id': bus_id,
                     'message': 'Failed to store entry'
                 }
         
@@ -1015,43 +1035,48 @@ class SimplifiedBusTracker:
                 return {
                     'action': 'matched_journey',
                     'passenger_id': match_result['id'],
-                    'bus_id': self.bus_id,
+                    'bus_id': bus_id,  # Use bus_id from request
                     'entry_face_id': match_result['entry_face_id'],
                     'exit_face_id': match_result['exit_face_id'],
                     'similarity': float(similarity),
                     'journey_duration': match_result['journey_duration_minutes'],
-                    'message': f'✅ Journey completed! Passenger {match_result["id"]} (similarity: {similarity:.3f}, duration: {match_result["journey_duration_minutes"]:.1f} min)'
+                    'message': f'✅ Journey on {bus_id}! Passenger {match_result["id"]} (similarity: {similarity:.3f}, duration: {match_result["journey_duration_minutes"]:.1f} min)'
                 }
             else:
                 # Store unmatched exit
                 unmatched_exit_id = self.store_unmatched_exit(log_entry, similarity)
                 return {
                     'action': 'unmatched_exit',
-                    'bus_id': self.bus_id,
+                    'bus_id': bus_id,  # Use bus_id from request
                     'face_id': log_entry.get('face_id', 0),
                     'best_similarity': float(similarity),
                     'unmatched_id': unmatched_exit_id,
-                    'message': f'❌ No matching entry found for exit face_id {log_entry.get("face_id", 0)} (best similarity: {similarity:.3f}) - Stored as unmatched'
+                    'message': f'❌ No match on {bus_id} for exit face_id {log_entry.get("face_id", 0)} (best: {similarity:.3f})'
                 }
         
         else:
             return {
                 'action': 'error',
+                'bus_id': bus_id,
                 'message': f'Unknown location_type: {location_type}'
             }
     
     def store_unmatched_exit(self, exit_log, best_similarity):
-        """Store unmatched exit passenger"""
+        """Store unmatched exit passenger - supports multiple buses"""
         try:
-            # Ensure we have an active trip
-            if not self.current_trip or self.current_trip.get('status') != 'active':
-                print("⚠️ No active trip for unmatched exit")
+            # Get bus_id from exit log
+            bus_id = exit_log.get('bus_id', self.default_bus_id)
+            
+            # Get current trip for this bus
+            current_trip = self.get_current_trip_for_bus(bus_id)
+            if not current_trip or current_trip.get('status') != 'active':
+                print(f"⚠️ No active trip for {bus_id} for unmatched exit")
                 return None
             
             unmatched_exit = {
-                "trip_id": self.current_trip['trip_id'],  # NEW!
-                "trip_start_time": self.current_trip['start_time'],  # NEW!
-                "bus_id": self.bus_id,
+                "trip_id": current_trip['trip_id'],
+                "trip_start_time": current_trip['start_time'],
+                "bus_id": bus_id,  # Use bus_id from request
                 "route_name": self.route_name,
                 "type": "EXIT",
                 "face_id": exit_log.get('face_id', 0),
@@ -1070,48 +1095,74 @@ class SimplifiedBusTracker:
             }
             
             result = self.unmatched_passengers.insert_one(unmatched_exit)
-            print(f"📝 Stored unmatched exit: {result.inserted_id}")
+            print(f"📝 Stored unmatched exit for {bus_id}: {result.inserted_id}")
             return str(result.inserted_id)
             
         except Exception as e:
             print(f"❌ Error storing unmatched exit: {e}")
             return None
     
-    def cleanup_old_temp_entries(self, hours_old=24):
-        """Move old temp entries to unmatched collection"""
+    def cleanup_old_temp_entries(self, hours_old=24, bus_id=None, trip_id=None):
+        """Move old/orphaned temp entries to unmatched collection - supports multiple buses
+        
+        Args:
+            hours_old: Clean entries older than this many hours. If 0, clean ALL entries for the specified bus/trip
+            bus_id: Filter cleanup to specific bus
+            trip_id: Filter cleanup to specific trip
+        """
         try:
-            cutoff_time = datetime.now() - timedelta(hours=hours_old)
-            old_entries = list(self.temp_entries.find({
-                "bus_id": self.bus_id,
-                "entry_timestamp": {"$lt": cutoff_time}
-            }))
+            # Build query based on parameters
+            query = {}
             
-            if old_entries:
-                for entry in old_entries:
+            if hours_old > 0:
+                # Time-based cleanup - clean entries older than hours_old
+                cutoff_time = datetime.now() - timedelta(hours=hours_old)
+                query["entry_timestamp"] = {"$lt": cutoff_time}
+                reason = f"No exit found within {hours_old} hours"
+            else:
+                # Trip end cleanup - clean ALL remaining entries for this bus/trip
+                reason = "Trip ended - no exit match found"
+            
+            # Add bus_id filter if specified
+            if bus_id:
+                query["bus_id"] = bus_id
+            
+            # Add trip_id filter if specified  
+            if trip_id:
+                query["trip_id"] = trip_id
+            
+            # Find entries to clean up
+            entries_to_clean = list(self.temp_entries.find(query))
+            
+            if entries_to_clean:
+                print(f"🔍 Found {len(entries_to_clean)} temp entries to clean" + (f" for {bus_id}" if bus_id else ""))
+                
+                for entry in entries_to_clean:
+                    entry_bus_id = entry.get('bus_id', self.default_bus_id)
                     unmatched_entry = {
                         "trip_id": entry.get('trip_id', 'UNKNOWN'),
-                        "bus_id": self.bus_id,
-                        "route_name": self.route_name,
+                        "bus_id": entry_bus_id,
+                        "route_name": entry.get('route_name', self.route_name),
                         "type": "ENTRY",
                         "trip_start_time": entry.get('trip_start_time'),
                         "face_id": entry.get('face_id', 0),
                         "face_embedding": entry.get('face_embedding', []),
                         "embedding_size": entry.get('embedding_size', 0),
-                        "location": entry['entry_location'],
-                        "timestamp": entry['entry_timestamp'],
+                        "location": entry.get('entry_location', {}),
+                        "timestamp": entry.get('entry_timestamp'),
                         "best_similarity_found": 0.0,
-                        "reason": f"No exit found within {hours_old} hours",
+                        "reason": reason,
                         "created_at": datetime.now()
                     }
                     self.unmatched_passengers.insert_one(unmatched_entry)
+                    print(f"   ➡️ Moved ENTRY face_id={entry.get('face_id')} to unmatchedPassengers")
                 
-                result = self.temp_entries.delete_many({
-                    "bus_id": self.bus_id,
-                    "entry_timestamp": {"$lt": cutoff_time}
-                })
+                result = self.temp_entries.delete_many(query)
                 
-                print(f"🗑️ Cleaned up {result.deleted_count} old temp entries")
-                return len(old_entries)
+                print(f"🗑️ Cleaned up {result.deleted_count} temp entries" + (f" for {bus_id}" if bus_id else ""))
+                return len(entries_to_clean)
+            else:
+                print(f"✅ No temp entries to clean" + (f" for {bus_id}" if bus_id else ""))
             
             return 0
             
@@ -1140,42 +1191,7 @@ class SimplifiedBusTracker:
             print(f"❌ Error parsing trip schedule: {e}")
             return False
     
-    # Removed: configure_distance_api() - Never called, OSRM is hardcoded
-    
-    def get_stats(self):
-        """Get current statistics"""
-        try:
-            temp_count = self.temp_entries.count_documents({"bus_id": self.bus_id})
-            final_count = self.final_passengers.count_documents({"bus_id": self.bus_id})
-            unmatched_count = self.unmatched_passengers.count_documents({"bus_id": self.bus_id})
-            unmatched_entries = self.unmatched_passengers.count_documents({"bus_id": self.bus_id, "type": "ENTRY"})
-            unmatched_exits = self.unmatched_passengers.count_documents({"bus_id": self.bus_id, "type": "EXIT"})
-            
-            # Get distance calculation stats
-            journeys_with_distance = self.final_passengers.count_documents({
-                "bus_id": self.bus_id, 
-                "distance_info.success": True
-            })
-            
-            # Perform cleanup of old temp entries
-            cleaned_count = self.cleanup_old_temp_entries()
-            
-            return {
-                "bus_id": self.bus_id,
-                "route_name": self.route_name,
-                "temporary_entries": temp_count,
-                "completed_journeys": final_count,
-                "journeys_with_distance": journeys_with_distance,
-                "unmatched_passengers": unmatched_count,
-                "unmatched_entries": unmatched_entries,
-                "unmatched_exits": unmatched_exits,
-                "passengers_currently_inside": temp_count,
-                "cleaned_old_entries": cleaned_count,
-                "distance_api_provider": self.distance_api_config['provider']
-            }
-        except Exception as e:
-            print(f"❌ Error getting stats: {e}")
-            return {"error": str(e)}
+    # Removed: get_stats() - Never called, stats handled by Node.js backend
 
 # Global tracker instance
 bus_tracker = SimplifiedBusTracker()
@@ -1312,86 +1328,103 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
         
         # ESP32 Trip Context Endpoint - OPTIMIZED
         elif self.path.startswith('/api/trip-context'):
-            query_params = self._get_query_params()
-            bus_id = query_params.get('bus_id', [bus_tracker.bus_id])[0]
-            esp32_trip_start = query_params.get('trip_start', [None])[0]
-            esp32_trip_end = query_params.get('trip_end', [None])[0]
-            
-            # Get current time
-            current_time = datetime.now()
-            current_time_str = current_time.strftime("%H:%M")
-            
-            # AUTOMATIC TRIP MANAGEMENT based on ESP32 schedule
-            if esp32_trip_start and esp32_trip_end:
-                print(f"📅 ESP32 provided schedule: {esp32_trip_start} - {esp32_trip_end}")
+            try:
+                query_params = self._get_query_params()
+                bus_id = query_params.get('bus_id', [bus_tracker.bus_id])[0]
+                esp32_trip_start = query_params.get('trip_start', [None])[0]
+                esp32_trip_end = query_params.get('trip_end', [None])[0]
                 
-                # Check if current time is within ESP32 trip schedule
-                is_esp32_trip_time = bus_tracker.is_within_trip_schedule(current_time_str, esp32_trip_start, esp32_trip_end)
+                # Get current time
+                current_time = datetime.now()
+                current_time_str = current_time.strftime("%H:%M")
                 
-                # Get current trip
-                current_trip = bus_tracker.get_current_trip()
-                
-                if is_esp32_trip_time:
-                    # Within ESP32 trip time - ensure we have an active trip
-                    if not current_trip or current_trip.get('status') != 'active':
-                        print(f"🚀 AUTO-START: Creating trip for ESP32 schedule {esp32_trip_start}-{esp32_trip_end}")
-                        # Move any old temp_entries to unmatched before starting new trip
-                        bus_tracker.cleanup_old_temp_entries_for_new_trip()
-                        # Auto-start trip
-                        bus_tracker.start_new_trip()
-                        current_trip = bus_tracker.get_current_trip()
+                # AUTOMATIC TRIP MANAGEMENT based on ESP32 schedule
+                if esp32_trip_start and esp32_trip_end:
+                    print(f"ESP32 provided schedule: {esp32_trip_start} - {esp32_trip_end}", flush=True)
+                    
+                    try:
+                        # Check if current time is within ESP32 trip schedule
+                        is_esp32_trip_time = bus_tracker.is_within_trip_schedule(current_time_str, esp32_trip_start, esp32_trip_end)
+                        
+                        # Get current trip for THIS specific bus
+                        current_trip = bus_tracker.get_current_trip(bus_id=bus_id)
+                        
+                        if is_esp32_trip_time:
+                            # Within ESP32 trip time - ensure we have an active trip
+                            if not current_trip or current_trip.get('status') != 'active':
+                                print(f"AUTO-START: Creating trip for ESP32 schedule {esp32_trip_start}-{esp32_trip_end} on {bus_id}", flush=True)
+                                # Move any old temp_entries to unmatched before starting new trip
+                                # Use hours_old=0 to clean ALL remaining entries for this bus
+                                print(f"cleaning old entries for {bus_id}...", flush=True)
+                                bus_tracker.cleanup_old_temp_entries(hours_old=0, bus_id=bus_id)
+                                # Auto-start trip for this specific bus
+                                print(f"starting new trip for {bus_id}...", flush=True)
+                                bus_tracker.start_new_trip(bus_id=bus_id)
+                                current_trip = bus_tracker.get_current_trip(bus_id=bus_id)
+                                print(f"trip started: {current_trip.get('trip_id') if current_trip else 'NONE'}", flush=True)
+                        else:
+                            # Outside ESP32 trip time - end active trip if exists
+                            if current_trip and current_trip.get('status') == 'active':
+                                print(f"AUTO-END: Trip ended for {bus_id} - outside ESP32 schedule {esp32_trip_start}-{esp32_trip_end}", flush=True)
+                                # FIXED: Pass bus_id to end trip for the correct bus
+                                bus_tracker.end_current_trip(bus_id=bus_id)
+                                current_trip = None
+                    except Exception as inner_e:
+                        print(f"CRASH in auto-mgmt logic: {inner_e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                        raise inner_e # Re-raise to be caught by outer handler
                 else:
-                    # Outside ESP32 trip time - end active trip if exists
-                    if current_trip and current_trip.get('status') == 'active':
-                        print(f"🏁 AUTO-END: Trip ended - outside ESP32 schedule {esp32_trip_start}-{esp32_trip_end}")
-                        bus_tracker.end_current_trip()
-                        current_trip = None
-            else:
-                # Fallback to existing logic without ESP32 schedule
-                current_trip = bus_tracker.get_current_trip()
-                esp32_trip_start = "06:00"  # Default
-                esp32_trip_end = "18:00"    # Default
-            
-            # Build response
-            if current_trip and current_trip.get('trip_id'):
-                # Active trip
-                response = {
-                    "trip_id": current_trip['trip_id'],
-                    "route_name": current_trip.get('route_name', 'Jaffna-Colombo'),
-                    "departure_city": current_trip.get('departure_city', 'Colombo'),
-                    "destination_city": current_trip.get('destination_city', 'Jaffna'),
-                    "schedule_start": esp32_trip_start,
-                    "schedule_end": esp32_trip_end,
-                    "trip_active": True,
-                    "trip_status": "active",
-                    "trip_date": datetime.now().strftime("%Y-%m-%d"),
-                    "bus_id": bus_id,
-                    "current_time": current_time.strftime("%H:%M:%S"),
-                    "passengers_inside": current_trip.get('passengers_inside', 0),
-                    "duration_minutes": current_trip.get('duration_minutes', 0),
-                    "auto_managed": True if esp32_trip_start and esp32_trip_end else False
-                }
-            else:
-                # No active trip
-                response = {
-                    "trip_id": f"WAITING_{bus_id}_{datetime.now().strftime('%Y%m%d')}",
-                    "route_name": "Jaffna-Colombo",
-                    "departure_city": "Colombo",
-                    "destination_city": "Jaffna", 
-                    "schedule_start": esp32_trip_start,
-                    "schedule_end": esp32_trip_end,
-                    "trip_active": False,
-                    "trip_status": "waiting_for_schedule",
-                    "trip_date": datetime.now().strftime("%Y-%m-%d"),
-                    "bus_id": bus_id,
-                    "current_time": current_time.strftime("%H:%M:%S"),
-                    "passengers_inside": 0,
-                    "next_departure": esp32_trip_start,
-                    "auto_managed": True if esp32_trip_start and esp32_trip_end else False
-                }
-            
-            print(f"📍 Trip context: {response['trip_status']} | Auto: {response.get('auto_managed', False)}")
-            self._send_json_response(response)
+                    # Fallback to existing logic without ESP32 schedule
+                    current_trip = bus_tracker.get_current_trip(bus_id=bus_id)
+                    esp32_trip_start = "06:00"  # Default
+                    esp32_trip_end = "18:00"    # Default
+                
+                # Build response
+                if current_trip and current_trip.get('trip_id'):
+                    # Active trip
+                    response = {
+                        "trip_id": current_trip['trip_id'],
+                        "route_name": current_trip.get('route_name', 'Jaffna-Colombo'),
+                        "departure_city": current_trip.get('departure_city', 'Colombo'),
+                        "destination_city": current_trip.get('destination_city', 'Jaffna'),
+                        "schedule_start": esp32_trip_start,
+                        "schedule_end": esp32_trip_end,
+                        "trip_active": True,
+                        "trip_status": "active",
+                        "trip_date": datetime.now().strftime("%Y-%m-%d"),
+                        "bus_id": bus_id,
+                        "current_time": current_time.strftime("%H:%M:%S"),
+                        "passengers_inside": current_trip.get('passengers_inside', 0),
+                        "duration_minutes": current_trip.get('duration_minutes', 0),
+                        "auto_managed": True if esp32_trip_start and esp32_trip_end else False
+                    }
+                else:
+                    # No active trip
+                    response = {
+                        "trip_id": f"WAITING_{bus_id}_{datetime.now().strftime('%Y%m%d')}",
+                        "route_name": "Jaffna-Colombo",
+                        "departure_city": "Colombo",
+                        "destination_city": "Jaffna", 
+                        "schedule_start": esp32_trip_start,
+                        "schedule_end": esp32_trip_end,
+                        "trip_active": False,
+                        "trip_status": "waiting_for_schedule",
+                        "trip_date": datetime.now().strftime("%Y-%m-%d"),
+                        "bus_id": bus_id,
+                        "current_time": current_time.strftime("%H:%M:%S"),
+                        "passengers_inside": 0,
+                        "next_departure": esp32_trip_start,
+                        "auto_managed": True if esp32_trip_start and esp32_trip_end else False
+                    }
+                
+                print(f"Trip context: {response['trip_status']} | Auto: {response.get('auto_managed', False)}")
+                self._send_json_response(response)
+            except Exception as e:
+                import traceback
+                print(f"ERROR in trip-context: {e}")
+                traceback.print_exc()
+                self._send_error_response(f"Trip context error: {str(e)}", 500)
         
         # ESP32 Power Config Endpoint
         elif self.path.startswith('/api/power-config'):
@@ -1513,6 +1546,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 
                 json_data = json.loads(post_data.decode('utf-8'))
                 device_id = json_data.get('device_id', 'unknown')
+                bus_id = json_data.get('bus_id', bus_tracker.default_bus_id)  # MULTI-BUS: Extract bus_id
                 logs = json_data.get('logs', [])
                 
                 # Determine location type from endpoint
@@ -1524,16 +1558,18 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                     location_type = logs[0].get('location_type', 'UNKNOWN') if logs else 'UNKNOWN'
                 
                 print(f"\n🚌 ESP32 Face Detection Data Received")
+                print(f"Bus: {bus_id}")  # MULTI-BUS: Show bus_id
                 print(f"Device: {device_id}")
                 print(f"Type: {location_type}")
                 print(f"Logs: {len(logs)}")
                 
                 results = []
                 for i, log in enumerate(logs):
-                    # Add location_type to the log entry
+                    # Add location_type and bus_id to the log entry
                     log['location_type'] = location_type
+                    log['bus_id'] = bus_id  # MULTI-BUS: Add bus_id to each log
                     
-                    print(f"\n📍 Processing: {location_type} - Face ID: {log.get('face_id')}")
+                    print(f"\n📍 Processing: {location_type} on {bus_id} - Face ID: {log.get('face_id')}")
                     
                     # Process using existing system
                     result = bus_tracker.process_face_log(log)
@@ -1569,8 +1605,9 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 
                 response = {
                     "status": "received",
-                    "message": f"Processed {len(logs)} {location_type.lower()} logs",
+                    "message": f"Processed {len(logs)} {location_type.lower()} logs for {bus_id}",
                     "log_count": len(logs),
+                    "bus_id": bus_id,  # MULTI-BUS: Include bus_id in response
                     "device_id": device_id,
                     "processing_summary": {
                         "matched_journeys": matched_journeys,
@@ -1590,8 +1627,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 try:
                     data = json.loads(post_data.decode('utf-8'))
                     device_id = data.get('device_id', 'UNKNOWN')
-                    # Use provided bus_id or default to tracking bus
-                    target_bus_id = data.get('bus_id', bus_tracker.bus_id)
+                    target_bus_id = data.get('bus_id', bus_tracker.default_bus_id)
                     
                     print(f"💓 Heartbeat received from {device_id} (Bus: {target_bus_id})")
                     
@@ -1678,9 +1714,10 @@ def run_server(port=None):
     httpd = HTTPServer(server_address, SimplifiedHandler)
     
     print(f"\n{'='*70}")
-    print(f"🚌 Python Backend - ESP32 Processing Engine Only")
+    print(f"🚌 Python Backend - ESP32 Processing Engine (MULTI-BUS ENABLED)")
     print(f"{'='*70}")
-    print(f"📍 Bus: {bus_tracker.bus_id} ({bus_tracker.route_name})")
+    print(f"📍 Default Bus: {bus_tracker.default_bus_id} ({bus_tracker.route_name})")
+    print(f"🔄 Multi-bus support: Accepts bus_id from ESP32 requests")
     print(f"🌐 Server running on port {port}")
     print(f"Press Ctrl+C to stop the server")
     print(f"{'='*70}\n")
