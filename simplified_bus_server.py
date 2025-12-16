@@ -1462,7 +1462,8 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                         "maintenance_interval": config.get('maintenance_interval', 5),
                         "maintenance_duration": config.get('maintenance_duration', 3),
                         "boards": config.get('boards', []),
-                        "last_updated": config['last_updated'].isoformat() if isinstance(config.get('last_updated'), datetime) else config.get('last_updated')
+                        "last_updated": config['last_updated'].isoformat() if isinstance(config.get('last_updated'), datetime) else config.get('last_updated'),
+                        "current_server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
                     self._send_json_response(response)
                 else:
@@ -1585,6 +1586,27 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                     
                     print(f"\n📍 Processing: {location_type} on {bus_id} - Face ID: {log.get('face_id')}")
                     
+                    # --- VALIDATION: Bus ID and Time ---
+                    # 1. Validate Bus ID
+                    if not bus_tracker.power_configs.find_one({"bus_id": bus_id}):
+                        print(f"⚠️ REJECTING: Unknown Bus ID {bus_id}")
+                        results.append({"action": "rejected", "message": "Unknown Bus ID"})
+                        continue
+
+                    # 2. Validate Time (Prevent 1970/default dates)
+                    log_time_str = log.get('timestamp')
+                    parsed_time = bus_tracker._parse_timestamp_safe(log_time_str)
+                    if parsed_time.year < 2024:
+                        print(f"⚠️ REJECTING: Invalid timestamp {parsed_time} (System time not synced?)")
+                        results.append({"action": "rejected", "message": "Invalid Timestamp"})
+                        continue
+                        
+                    # 3. Validate Trip Window (Optional: Ensure strictly within schedule)
+                    # This prevents "false data" from outside operating hours
+                    # We reuse the logic from power management: check if time is in any window
+                    # For now, we trust the ESP32 if it claims to be in a trip, BUT we verified the time above.
+                    # -----------------------------------
+
                     # Process using existing system
                     result = bus_tracker.process_face_log(log)
                     results.append(result)

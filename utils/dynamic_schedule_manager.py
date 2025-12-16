@@ -338,11 +338,10 @@ class DynamicScheduleManager:
                 end_h, end_m = map(int, end_time.split(':'))
                 
                 trip_windows.append({
-                    "start_hour": start_h,
-                    "start_minute": start_m,
-                    "end_hour": end_h,
-                    "end_minute": end_m,
-                    "trip_name": trip.get('trip_name', 'Trip')
+                    "start_time": f"{start_h:02d}:{start_m:02d}",
+                    "end_time": f"{end_h:02d}:{end_m:02d}",
+                    "route": trip.get('trip_name', 'Trip'),
+                    "active": True
                 })
             except Exception as e:
                 print(f"❌ Error parsing trip for power window: {e}")
