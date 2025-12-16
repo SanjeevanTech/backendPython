@@ -1225,6 +1225,20 @@ def get_power_config(bus_id):
         # Remove MongoDB _id
         if '_id' in config:
             del config['_id']
+            
+        # ENRICH WITH DYNAMIC SCHEDULE
+        # If we have the schedule manager and it matches this bus, inject today's trips
+        if schedule_manager and schedule_manager.bus_id == bus_id:
+            try:
+                trip_windows = schedule_manager.get_todays_trip_windows()
+                if trip_windows:
+                    print(f"✅ Injecting {len(trip_windows)} dynamic trip windows for {bus_id}")
+                    config['trip_windows'] = trip_windows
+                    config['use_multi_trip'] = True
+                    # If we have dynamic windows, ensure deep sleep is enabled (usually desired)
+                    # config['deep_sleep_enabled'] = True 
+            except Exception as e:
+                print(f"⚠️ Error injecting dynamic schedule: {e}")
         
         return config
     except Exception as e:

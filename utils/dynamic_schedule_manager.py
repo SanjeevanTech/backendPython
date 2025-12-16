@@ -306,6 +306,50 @@ class DynamicScheduleManager:
         
         return schedule_copy
     
+    def get_todays_trip_windows(self):
+        """Get trip windows for today for power management"""
+        if not self.current_schedule:
+            return []
+            
+        trip_windows = []
+        today_name = datetime.now().strftime('%A').lower()
+        
+        for trip in self.current_schedule.get('trips', []):
+            if not trip.get('active', True):
+                continue
+                
+            days = [d.lower() for d in trip.get('days_of_week', [])]
+            if today_name not in days:
+                continue
+                
+            try:
+                # Get start time
+                start_time = trip.get('boarding_start_time', '06:00')
+                start_h, start_m = map(int, start_time.split(':'))
+                
+                # Calculate end time
+                arrival_time = trip.get('estimated_arrival_time', start_time)
+                stop_minutes = trip.get('stop_duration_minutes', 30)
+                
+                # Use same calculation as scheduler
+                arrival_dt = datetime.strptime(arrival_time, "%H:%M")
+                end_dt = arrival_dt + timedelta(minutes=stop_minutes)
+                end_time = end_dt.strftime("%H:%M")
+                end_h, end_m = map(int, end_time.split(':'))
+                
+                trip_windows.append({
+                    "start_hour": start_h,
+                    "start_minute": start_m,
+                    "end_hour": end_h,
+                    "end_minute": end_m,
+                    "trip_name": trip.get('trip_name', 'Trip')
+                })
+            except Exception as e:
+                print(f"❌ Error parsing trip for power window: {e}")
+                continue
+                
+        return trip_windows
+    
     def run_scheduler(self):
         """Run the scheduler continuously"""
         self.scheduler_running = True
