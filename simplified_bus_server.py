@@ -15,7 +15,7 @@ import numpy as np
 import requests
 import math
 from datetime import datetime, timedelta, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from sklearn.metrics.pairwise import cosine_similarity
 from pymongo import MongoClient
@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from utils.dynamic_schedule_manager import DynamicScheduleManager
 from route_detector import RouteDetector
+from face_recognition_helper import extract_face_embedding_from_base64
 
 class SimplifiedBusTracker:
     def __init__(self, mongo_url="mongodb+srv://sanjeeBusPassenger:Hz3czXqVoc4ThTiO@buspassenger.lskaqo5.mongodb.net/?retryWrites=true&w=majority&appName=BusPassenger"):
@@ -46,6 +47,8 @@ class SimplifiedBusTracker:
         self.similarity_threshold = 0.7
         self.season_ticket_similarity_threshold = 0.65  # Lower threshold for ESP32 face variations
         self.time_window_hours = 48  # Increased to 48 hours for testing
+        self.timezone_offset_hours = 5.5  # Adjust for Sri Lanka (+5:30)
+        self.debug_allow_all_logs = True  # SET TO TRUE FOR TESTING (Accepts logs outside schedule)
         
         # Trip session management - MULTI-BUS SUPPORT
         self.current_trips = {}  # Dict: bus_id -> current_trip (supports multiple buses)
@@ -175,7 +178,7 @@ class SimplifiedBusTracker:
             bus_id = self.default_bus_id
         try:
             if start_time is None:
-                start_time = datetime.now()
+                start_time = datetime.utcnow()
             
             # End previous trip for this bus if exists
             if bus_id in self.current_trips and self.current_trips[bus_id].get('status') == 'active':
@@ -206,7 +209,7 @@ class SimplifiedBusTracker:
                 'total_passengers': 0,
                 'total_unmatched': 0,
                 'route_detection_gps': initial_gps,
-                'created_at': datetime.now()
+                'created_at': datetime.utcnow()
             }
             
             result = self.trip_sessions.insert_one(trip_session)
@@ -280,7 +283,7 @@ class SimplifiedBusTracker:
                 {
                     "$set": {
                         "status": "completed",
-                        "end_time": datetime.now(),
+                        "end_time": datetime.utcnow(),
                         "total_passengers": passenger_count,
                         "total_unmatched": unmatched_count
                     }
@@ -777,7 +780,7 @@ class SimplifiedBusTracker:
                     "timestamp": log_entry.get('timestamp')
                 },
                 "entry_timestamp": self._parse_timestamp_safe(log_entry.get('timestamp')),
-                "created_at": datetime.now()
+                "created_at": datetime.utcnow()
             }
             
             result = self.temp_entries.insert_one(temp_entry)
@@ -1069,13 +1072,19 @@ class SimplifiedBusTracker:
             
             # Get current trip for this bus
             current_trip = self.get_current_trip_for_bus(bus_id)
-            if not current_trip or current_trip.get('status') != 'active':
-                print(f"⚠️ No active trip for {bus_id} for unmatched exit")
-                return None
+            
+            # Determine trip details (with fallback)
+            if current_trip and current_trip.get('status') == 'active':
+                trip_id = current_trip['trip_id']
+                trip_start_time = current_trip['start_time']
+            else:
+                print(f"⚠️ No active trip for {bus_id} - storing unmatched exit with FALLBACK trip")
+                trip_id = f"FALLBACK_{bus_id}_{datetime.now().strftime('%Y%m%d_%H%M')}"
+                trip_start_time = datetime.utcnow()
             
             unmatched_exit = {
-                "trip_id": current_trip['trip_id'],
-                "trip_start_time": current_trip['start_time'],
+                "trip_id": trip_id,
+                "trip_start_time": trip_start_time,
                 "bus_id": bus_id,  # Use bus_id from request
                 "route_name": self.route_name,
                 "type": "EXIT",
@@ -1091,7 +1100,7 @@ class SimplifiedBusTracker:
                 "timestamp": self._parse_timestamp_safe(exit_log.get('timestamp')),
                 "best_similarity_found": float(best_similarity),
                 "reason": "No matching entry found",
-                "created_at": datetime.now()
+                "created_at": datetime.utcnow()
             }
             
             result = self.unmatched_passengers.insert_one(unmatched_exit)
@@ -1226,19 +1235,22 @@ def get_power_config(bus_id):
         if '_id' in config:
             del config['_id']
             
-        # ENRICH WITH DYNAMIC SCHEDULE
-        # If we have the schedule manager and it matches this bus, inject today's trips
-        if schedule_manager and schedule_manager.bus_id == bus_id:
+        # ENRICH WITH DYNAMIC SCHEDULE (LIVE FETCH)
+        if schedule_manager:
             try:
-                trip_windows = schedule_manager.get_todays_trip_windows()
+                # Always fetch the latest schedule for THIS specific bus from MongoDB
+                trip_windows = schedule_manager.get_todays_trip_windows(bus_id=bus_id)
                 if trip_windows:
-                    print(f"✅ Injecting {len(trip_windows)} dynamic trip windows for {bus_id}")
+                    print(f"✅ Injecting {len(trip_windows)} LIVE trip windows for {bus_id}")
                     config['trip_windows'] = trip_windows
                     config['use_multi_trip'] = True
-                    # If we have dynamic windows, ensure deep sleep is enabled (usually desired)
-                    # config['deep_sleep_enabled'] = True 
+                else:
+                    print(f"ℹ️ No active schedule windows found in MongoDB for {bus_id}")
             except Exception as e:
-                print(f"⚠️ Error injecting dynamic schedule: {e}")
+                print(f"⚠️ Error injecting dynamic schedule for {bus_id}: {e}")
+        
+        # Inject current server time for ESP32 sync
+        config['current_server_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         return config
     except Exception as e:
@@ -1483,16 +1495,18 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
             # ESP32 Face Embedding Extraction Endpoint
             if parsed_path.path == '/api/extract-face-embedding':
                 content_length = int(self.headers.get('Content-Length', 0))
+                print(f"📸 Incoming face photo: {content_length / 1024:.1f} KB")
+                
+                # Read data
                 post_data = self.rfile.read(content_length)
+                print(f"📥 Data received, parsing JSON...")
                 
                 data = json.loads(post_data.decode('utf-8'))
                 image_data = data.get('image_data', '')
+                print(f"🔍 Starting face extraction...")
                 
-                print(f"📸 Face embedding extraction request received")
-                
-                # Import face recognition helper
+                # Process using the pre-loaded helper
                 try:
-                    from face_recognition_helper import extract_face_embedding_from_base64
                     result = extract_face_embedding_from_base64(image_data)
                 except ImportError:
                     print("⚠️ face_recognition_helper not found, using fallback")
@@ -1601,10 +1615,64 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                         results.append({"action": "rejected", "message": "Invalid Timestamp"})
                         continue
                         
-                    # 3. Validate Trip Window (Optional: Ensure strictly within schedule)
-                    # This prevents "false data" from outside operating hours
-                    # We reuse the logic from power management: check if time is in any window
-                    # For now, we trust the ESP32 if it claims to be in a trip, BUT we verified the time above.
+                    # 3. Validate Trip Window (STRICT SCHEDULE CHECK)
+                    # REQ: Store ONLY if bus_id schedule time is correct
+                    is_in_window = False
+                    if schedule_manager:
+                        # Fetch the dynamic schedule for this specific bus
+                        schedule_doc = schedule_manager.bus_schedules.find_one({
+                            "bus_id": bus_id,
+                            "active": True
+                        })
+                        
+                        if schedule_doc:
+                            # Convert UTC log time to Local Time for comparison with Local Schedule
+                            local_time = parsed_time + timedelta(hours=bus_tracker.timezone_offset_hours)
+                            log_time_hhmm = local_time.strftime("%H:%M")
+                            today_name = local_time.strftime('%A').lower()
+                            
+                            print(f"⏰ Checking schedule: Log UTC {parsed_time.strftime('%H:%M')} -> Local {log_time_hhmm} vs trips")
+                            
+                            for trip in schedule_doc.get('trips', []):
+                                if not trip.get('active', True): continue
+                                
+                                # Check if log is on a scheduled day
+                                days = [d.lower() for d in trip.get('days_of_week', [])]
+                                # Default to all days if days_of_week is empty or missing
+                                if days and today_name not in days: continue
+                                
+                                # Get window: Boarding Start -> Arrival + Stop Duration
+                                start_t = trip.get('boarding_start_time', '06:00')
+                                arrival_t = trip.get('estimated_arrival_time', start_t)
+                                stop_mins = trip.get('stop_duration_minutes', 30)
+                                
+                                try:
+                                    arrival_dt = datetime.strptime(arrival_t, "%H:%M")
+                                    end_dt = arrival_dt + timedelta(minutes=stop_mins)
+                                    end_t = end_dt.strftime("%H:%M")
+                                    
+                                    # Use cross-day aware comparison
+                                    if bus_tracker.is_within_trip_schedule(log_time_hhmm, start_t, end_t):
+                                        is_in_window = True
+                                        break
+                                except Exception as e:
+                                    print(f"⚠️ Error parsing schedule window for {bus_id}: {e}")
+                                    continue
+                        else:
+                            print(f"⚠️ No active schedule found in MongoDB for bus {bus_id}")
+                    
+                    if not is_in_window:
+                        check_time = local_time.strftime('%H:%M') if 'local_time' in locals() else parsed_time.strftime('%H:%M')
+                        
+                        if bus_tracker.debug_allow_all_logs:
+                            print(f"🛠️ DEBUG BYPASS: Log for {bus_id} at {check_time} (Local) accepted despite schedule.")
+                            is_in_window = True
+                        else:
+                            print(f"❌ REJECTING: Log for {bus_id} at {check_time} (Local) is OUTSIDE scheduled trip hours.")
+                            results.append({"action": "rejected", "message": f"Outside Scheduled Trip Hours (Log:{check_time})"})
+                            continue
+                    
+                    print(f"✅ Log accepted: {bus_id} time is within scheduled window")
                     # -----------------------------------
 
                     # Process using existing system
@@ -1745,9 +1813,9 @@ def run_server(port=None):
     # Use environment variable PORT for production deployment
     if port is None:
         port = int(os.environ.get('PORT', 8888))
-    
+        
     server_address = ('0.0.0.0', port)  # Bind to 0.0.0.0 for external access
-    httpd = HTTPServer(server_address, SimplifiedHandler)
+    httpd = ThreadingHTTPServer(server_address, SimplifiedHandler)
     
     print(f"\n{'='*70}")
     print(f"🚌 Python Backend - ESP32 Processing Engine (MULTI-BUS ENABLED)")

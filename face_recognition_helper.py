@@ -23,179 +23,15 @@ except ImportError:
     print("⚠️ face_recognition library not installed - using MOCK mode")
     print("   Install with: pip install face-recognition")
 
-def setup_image_directories():
-    """
-    Create necessary directories for image storage
-    Returns paths dict
-    """
-    base_dir = Path(__file__).parent
-    
-    paths = {
-        'temp': base_dir / 'images' / 'temp',
-        'permanent': base_dir / 'images' / 'permanent',
-        'failed': base_dir / 'images' / 'failed'
-    }
-    
-    # Create directories if they don't exist
-    for path in paths.values():
-        path.mkdir(parents=True, exist_ok=True)
-    
-    return paths
+# Face recognition memory-optimized processing (No disk storage)
 
-def save_image_to_disk(image_data_base64, user_id=None, detection_type='entry', storage_type='temp'):
+def extract_face_embedding_from_base64(image_data_base64, draw_boxes=True):
     """
-    Save image to disk BEFORE processing (best practice)
+    Extract face embedding from base64 encoded image (Memory only)
     
     Args:
-        image_data_base64: Base64 encoded image
-        user_id: User/passenger identifier (optional)
-        detection_type: 'entry' or 'exit'
-        storage_type: 'temp', 'permanent', or 'failed'
-    
-    Returns:
-        dict: {
-            'success': bool,
-            'file_path': str,
-            'filename': str,
-            'message': str
-        }
-    """
-    try:
-        # Setup directories
-        paths = setup_image_directories()
-        
-        # Remove data URI prefix if present
-        if ',' in image_data_base64:
-            image_data_base64 = image_data_base64.split(',')[1]
-        
-        # Decode image
-        image_bytes = base64.b64decode(image_data_base64)
-        
-        # Generate filename with timestamp
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        user_prefix = f"{user_id}_" if user_id else ""
-        filename = f"{user_prefix}{detection_type}_{timestamp}.jpg"
-        
-        # Determine storage path
-        storage_path = paths.get(storage_type, paths['temp'])
-        file_path = storage_path / filename
-        
-        # Save image
-        with open(file_path, 'wb') as f:
-            f.write(image_bytes)
-        
-        print(f"✅ Image saved: {file_path}")
-        
-        return {
-            'success': True,
-            'file_path': str(file_path),
-            'filename': filename,
-            'storage_type': storage_type,
-            'message': f'Image saved to {storage_type} storage'
-        }
-        
-    except Exception as e:
-        print(f"❌ Error saving image: {e}")
-        return {
-            'success': False,
-            'file_path': None,
-            'filename': None,
-            'message': f'Failed to save image: {str(e)}'
-        }
-
-def move_image(source_path, destination_type='permanent'):
-    """
-    Move image from temp to permanent storage after successful processing
-    
-    Args:
-        source_path: Current file path
-        destination_type: 'permanent' or 'failed'
-    
-    Returns:
-        dict: {
-            'success': bool,
-            'new_path': str,
-            'message': str
-        }
-    """
-    try:
-        source = Path(source_path)
-        if not source.exists():
-            return {
-                'success': False,
-                'new_path': None,
-                'message': 'Source file not found'
-            }
-        
-        # Setup directories
-        paths = setup_image_directories()
-        destination_dir = paths.get(destination_type, paths['permanent'])
-        
-        # New path with same filename
-        new_path = destination_dir / source.name
-        
-        # Move file
-        source.rename(new_path)
-        
-        print(f"✅ Image moved: {source} → {new_path}")
-        
-        return {
-            'success': True,
-            'new_path': str(new_path),
-            'message': f'Image moved to {destination_type} storage'
-        }
-        
-    except Exception as e:
-        print(f"❌ Error moving image: {e}")
-        return {
-            'success': False,
-            'new_path': None,
-            'message': f'Failed to move image: {str(e)}'
-        }
-
-def cleanup_old_temp_images(hours=24):
-    """
-    Delete temporary images older than specified hours
-    
-    Args:
-        hours: Age threshold in hours (default 24)
-    
-    Returns:
-        int: Number of files deleted
-    """
-    try:
-        paths = setup_image_directories()
-        temp_dir = paths['temp']
-        
-        deleted_count = 0
-        cutoff_time = datetime.now().timestamp() - (hours * 3600)
-        
-        for file_path in temp_dir.glob('*.jpg'):
-            if file_path.stat().st_mtime < cutoff_time:
-                file_path.unlink()
-                deleted_count += 1
-                print(f"🗑️ Deleted old temp image: {file_path.name}")
-        
-        if deleted_count > 0:
-            print(f"✅ Cleaned up {deleted_count} old temp images")
-        
-        return deleted_count
-        
-    except Exception as e:
-        print(f"❌ Error cleaning up temp images: {e}")
-        return 0
-
-def extract_face_embedding_from_base64(image_data_base64, draw_boxes=True, user_id=None, detection_type='entry', save_image=True):
-    """
-    Extract face embedding from base64 encoded image with optional bounding boxes
-    BEST PRACTICE: Saves image BEFORE processing for debugging and audit trail
-    
-    Args:
-        image_data_base64: Base64 encoded image string (with or without data URI prefix)
+        image_data_base64: Base64 encoded image string
         draw_boxes: If True, draw green bounding boxes around detected faces
-        user_id: User/passenger identifier for filename (optional)
-        detection_type: 'entry' or 'exit' for filename
-        save_image: If True, save image to disk before processing
     
     Returns:
         dict: {
@@ -204,27 +40,13 @@ def extract_face_embedding_from_base64(image_data_base64, draw_boxes=True, user_
             'embedding_size': int,
             'num_faces': int,
             'face_locations': list,
-            'image_with_boxes': str (base64),
+            'image_with_boxes': str (base64 or none),
             'message': str,
-            'is_mock': bool,
-            'saved_image': dict (file info if saved)
+            'is_mock': bool
         }
     """
-    saved_image_info = None
-    
     try:
-        # STEP 1: Save image FIRST (before processing) - BEST PRACTICE
-        if save_image:
-            saved_image_info = save_image_to_disk(
-                image_data_base64, 
-                user_id=user_id, 
-                detection_type=detection_type,
-                storage_type='temp'
-            )
-            if not saved_image_info['success']:
-                print(f"⚠️ Warning: Failed to save image, continuing with processing")
-        
-        # STEP 2: Process the image
+        # STEP 1: Process the image in memory
         # Remove data URI prefix if present
         if ',' in image_data_base64:
             image_data_base64 = image_data_base64.split(',')[1]
@@ -240,7 +62,7 @@ def extract_face_embedding_from_base64(image_data_base64, draw_boxes=True, user_
         # Convert PIL Image to numpy array
         image_array = np.array(image)
         
-        # STEP 3: Run face recognition
+        # STEP 2: Run face recognition
         if FACE_RECOGNITION_AVAILABLE:
             # Real face recognition with bounding boxes
             result = extract_face_embedding_real(image_array, image, draw_boxes)
@@ -248,32 +70,12 @@ def extract_face_embedding_from_base64(image_data_base64, draw_boxes=True, user_
             # Mock face recognition
             result = extract_face_embedding_mock(image_array, image, draw_boxes)
         
-        # STEP 4: Move image based on success/failure
-        if saved_image_info and saved_image_info['success']:
-            if result['success']:
-                # Success: Move to permanent storage
-                move_result = move_image(saved_image_info['file_path'], 'permanent')
-                saved_image_info['final_path'] = move_result.get('new_path')
-                saved_image_info['final_storage'] = 'permanent'
-            else:
-                # Failed: Move to failed storage for debugging
-                move_result = move_image(saved_image_info['file_path'], 'failed')
-                saved_image_info['final_path'] = move_result.get('new_path')
-                saved_image_info['final_storage'] = 'failed'
-        
-        # Add saved image info to result
-        result['saved_image'] = saved_image_info
-        
         return result
             
     except Exception as e:
         print(f"❌ Error extracting face embedding: {e}")
         import traceback
         traceback.print_exc()
-        
-        # If we saved the image but processing failed, move to failed storage
-        if saved_image_info and saved_image_info['success']:
-            move_image(saved_image_info['file_path'], 'failed')
         
         return {
             'success': False,
@@ -283,8 +85,7 @@ def extract_face_embedding_from_base64(image_data_base64, draw_boxes=True, user_
             'face_locations': [],
             'image_with_boxes': None,
             'message': f'Error: {str(e)}',
-            'is_mock': False,
-            'saved_image': saved_image_info
+            'is_mock': False
         }
 
 def extract_face_embedding_real(image_array, original_image, draw_boxes=True):
@@ -301,9 +102,37 @@ def extract_face_embedding_real(image_array, original_image, draw_boxes=True):
     """
     try:
         from PIL import ImageDraw
+        import time as py_time
         
+        start_processing = py_time.time()
+        
+        # OPTIMIZATION: Resize image for FASTER face detection
+        # 640px is the "Goldilocks" size for CPU detection accuracy vs speed
+        height, width = image_array.shape[:2]
+        scaling_factor = 1.0
+        
+        if width > 640:
+            scaling_factor = 640.0 / width
+            new_width = 640
+            new_height = int(height * scaling_factor)
+            detection_image = original_image.resize((new_width, new_height), Image.LANCZOS)
+            detection_array = np.array(detection_image)
+            print(f"🚀 Detection Optimized: {width}x{height} -> 640x{new_height}")
+        else:
+            detection_array = image_array
+            
         # Detect face locations (top, right, bottom, left)
-        face_locations = face_recognition.face_locations(image_array)
+        detect_start = py_time.time()
+        face_locations = face_recognition.face_locations(detection_array, model="hog")
+        detect_end = py_time.time()
+        print(f"⏱️ Face detection took: {detect_end - detect_start:.2f}s (found {len(face_locations)} faces)")
+        
+        # Resize coordinates back to original image size
+        if scaling_factor != 1.0:
+            face_locations = [
+                (int(t/scaling_factor), int(r/scaling_factor), int(b/scaling_factor), int(l/scaling_factor))
+                for (t, r, b, l) in face_locations
+            ]
         
         if len(face_locations) == 0:
             return {
@@ -318,7 +147,35 @@ def extract_face_embedding_real(image_array, original_image, draw_boxes=True):
             }
         
         # Get face encodings (embeddings)
-        face_encodings = face_recognition.face_encodings(image_array, face_locations)
+        # OPTIMIZATION 2: Downsample for encoding if image is still large
+        # 640px is plenty for high accuracy encoding
+        encode_array = image_array
+        if width > 640:
+            scale_fac_enc = 640.0 / width
+            enc_w = 640
+            enc_h = int(height * scale_fac_enc)
+            encode_image = original_image.resize((enc_w, enc_h), Image.LANCZOS)
+            encode_array = np.array(encode_image)
+            
+            # Recalculate face locations for the encoding array
+            encoded_face_locations = []
+            for (top, right, bottom, left) in face_locations:
+                encoded_face_locations.append((
+                    int(top * scale_fac_enc),
+                    int(right * scale_fac_enc),
+                    int(bottom * scale_fac_enc),
+                    int(left * scale_fac_enc)
+                ))
+            
+            encode_start = py_time.time()
+            face_encodings = face_recognition.face_encodings(encode_array, encoded_face_locations, num_jitters=1)
+            encode_end = py_time.time()
+            print(f"⏱️ Face encoding took: {encode_end - encode_start:.2f}s (Optimized @ 640px)")
+        else:
+            encode_start = py_time.time()
+            face_encodings = face_recognition.face_encodings(image_array, face_locations, num_jitters=1)
+            encode_end = py_time.time()
+            print(f"⏱️ Face encoding took: {encode_end - encode_start:.2f}s")
         
         if len(face_encodings) == 0:
             return {
@@ -334,6 +191,9 @@ def extract_face_embedding_real(image_array, original_image, draw_boxes=True):
         
         # Use first face if multiple detected
         face_embedding = face_encodings[0].tolist()
+        
+        total_process_time = py_time.time() - start_processing
+        print(f"✅ Total process time: {total_process_time:.2f}s")
         
         # Draw bounding boxes if requested
         image_with_boxes_base64 = None

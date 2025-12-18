@@ -61,6 +61,7 @@ class DynamicScheduleManager:
             "trips": [
                 {
                     "trip_name": "Morning - Jaffna to Colombo",
+                    "route": "Jaffna-Colombo",
                     "direction": "jaffna_to_colombo",
                     "boarding_start_time": "06:00",
                     "departure_time": "07:00",
@@ -71,6 +72,7 @@ class DynamicScheduleManager:
                 },
                 {
                     "trip_name": "Evening - Colombo to Jaffna",
+                    "route": "Colombo-Jaffna",
                     "direction": "colombo_to_jaffna",
                     "boarding_start_time": "17:30",
                     "departure_time": "18:00",
@@ -306,15 +308,23 @@ class DynamicScheduleManager:
         
         return schedule_copy
     
-    def get_todays_trip_windows(self):
-        """Get trip windows for today for power management"""
-        if not self.current_schedule:
+    def get_todays_trip_windows(self, bus_id=None):
+        """Get trip windows for today for power management (Fresh from DB)"""
+        target_bus = bus_id if bus_id else self.bus_id
+        
+        # Always fetch fresh from DB to avoid staleness
+        schedule_doc = self.bus_schedules.find_one({
+            "bus_id": target_bus,
+            "active": True
+        })
+        
+        if not schedule_doc:
             return []
             
         trip_windows = []
         today_name = datetime.now().strftime('%A').lower()
         
-        for trip in self.current_schedule.get('trips', []):
+        for trip in schedule_doc.get('trips', []):
             if not trip.get('active', True):
                 continue
                 
@@ -340,7 +350,7 @@ class DynamicScheduleManager:
                 trip_windows.append({
                     "start_time": f"{start_h:02d}:{start_m:02d}",
                     "end_time": f"{end_h:02d}:{end_m:02d}",
-                    "route": trip.get('trip_name', 'Trip'),
+                    "route": trip.get('route', trip.get('trip_name', 'Trip')),
                     "active": True
                 })
             except Exception as e:

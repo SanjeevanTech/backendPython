@@ -1,2 +1,0 @@
-# This file ensures the images directory is tracked by git
-# Actual image files are ignored via .gitignore
