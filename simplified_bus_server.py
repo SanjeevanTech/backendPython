@@ -451,15 +451,14 @@ class SimplifiedBusTracker:
             # Try OSRM first
             result = self.calculate_road_distance_osrm(start_lat, start_lon, end_lat, end_lon)
             
-            # Fallback to Haversine if OSRM fails
             if not result:
-                haversine_km = self.calculate_haversine_distance(start_lat, start_lon, end_lat, end_lon)
-                result = {
-                    'distance_km': round(haversine_km, 2),
-                    'duration_minutes': round(haversine_km * 2, 1),
-                    'provider': 'haversine_fallback',
-                    'success': True,
-                    'note': 'Straight-line distance'
+                print(f"⚠️ OSRM failed. No road distance available. Journey may be inaccurately priced.")
+                return {
+                    'distance_km': 0.0,
+                    'duration_minutes': 0.0,
+                    'provider': 'failed',
+                    'success': False,
+                    'note': 'Road distance calculation failed'
                 }
             
             return result
