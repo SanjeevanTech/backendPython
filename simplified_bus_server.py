@@ -40,6 +40,7 @@ class SimplifiedBusTracker:
         self.unmatched_passengers = None  # Unmatched passengers collection
         self.power_configs = None     # Power management configurations per bus
         self.season_ticket_members = None  # Season ticket members collection
+        self.contractors = None       # Contractor collection
         
         # Configuration - MULTI-BUS SUPPORT
         self.default_bus_id = "BUS_JC_001"  # Default bus if none specified
@@ -72,6 +73,7 @@ class SimplifiedBusTracker:
             self.trip_sessions = self.db['tripSessions']       # Trip session tracking
             self.power_configs = self.db['powerConfigs']       # Power management configs per bus
             self.season_ticket_members = self.db['seasonTicketMembers']  # Season ticket members
+            self.contractors = self.db['contractors']          # Contractors
             
             # Create indexes
             self.temp_entries.create_index([("bus_id", 1), ("trip_id", 1), ("timestamp", 1)])
@@ -81,6 +83,7 @@ class SimplifiedBusTracker:
             self.power_configs.create_index([("bus_id", 1)], unique=True)
             self.season_ticket_members.create_index([("member_id", 1)], unique=True)
             self.season_ticket_members.create_index([("is_active", 1), ("valid_from", 1), ("valid_until", 1)])
+            self.contractors.create_index([("bus_id", 1)], unique=True)
             
             print("✅ Connected to MongoDB - Multi-Bus Tracking Enabled")
             print(f"🚌 Default Bus: {self.default_bus_id} ({self.route_name})")
@@ -94,6 +97,9 @@ class SimplifiedBusTracker:
             except Exception as e:
                 print(f"⚠️ Route detector initialization failed: {e}")
                 self.route_detector = None
+            
+            # Initialize contractor similarity threshold
+            self.contractor_similarity_threshold = 0.75  # Slightly higher for security
             
             # Don't auto-load trip on startup - trips are created on-demand per bus
             
@@ -154,6 +160,7 @@ class SimplifiedBusTracker:
                 self.current_trips[bus_id] = {
                     'trip_id': active_trip['trip_id'],
                     'bus_id': bus_id,
+                    'route_name': active_trip.get('route_name', self.route_name),
                     'start_time': active_trip['start_time'],
                     'status': 'active',
                     '_id': active_trip['_id']
@@ -218,6 +225,7 @@ class SimplifiedBusTracker:
             self.current_trips[bus_id] = {
                 'trip_id': trip_id,
                 'bus_id': bus_id,
+                'route_name': detected_route,
                 'start_time': start_time,
                 'status': 'active',
                 '_id': result.inserted_id
@@ -584,16 +592,55 @@ class SimplifiedBusTracker:
             
             now = datetime.now()
             
-            # FIRST: Try checking ALL active season ticket members (no route filtering)
-            # This ensures we don't miss matches due to GPS/route filtering issues
-            query_all = {
+            # 2. Build query for active members
+            query = {
                 "is_active": True,
                 "valid_from": {"$lte": now},
                 "valid_until": {"$gte": now},
                 "face_embedding": {"$exists": True, "$ne": []}
             }
             
-            all_active_members = list(self.season_ticket_members.find(query_all))
+            # 3. OPTIMIZATION: Filter members by route if route_name is provided
+            # This implements the user's request: "only check if bus has this waypoint"
+            if bus_route:
+                # We assume bus_route passed here is the route_name (e.g., "Jaffna-Colombo")
+                print(f"🛤️ Filtering season tickets for route: {bus_route}")
+                # Check if member's valid_routes patterns match this bus route
+                # or if the bus route name contains member's from/to locations
+                # We'll fetch all and filter in Python for complex pattern logic
+                all_active_members = list(self.season_ticket_members.find(query))
+                
+                filtered_members = []
+                for m in all_active_members:
+                    is_relevant = False
+                    for vr in m.get('valid_routes', []):
+                        patterns = vr.get('route_patterns', [])
+                        from_l = vr.get('from_location', '').lower()
+                        to_l = vr.get('to_location', '').lower()
+                        
+                        # Case 1: Direct pattern match
+                        if any(p.lower() in bus_route.lower() for p in patterns):
+                            is_relevant = True
+                            break
+                        
+                        # Case 2: Bus route name mentions the locations
+                        # (e.g. Jaffna-Colombo bus serves Jaffna-Kodikamam)
+                        if from_l and to_l and from_l in bus_route.lower() and to_l in bus_route.lower():
+                            is_relevant = True
+                            break
+                        
+                        # Case 3: No patterns defined, butlocations match
+                        if not patterns and (from_l in bus_route.lower() or to_l in bus_route.lower()):
+                            is_relevant = True
+                            break
+                    
+                    if is_relevant:
+                        filtered_members.append(m)
+                
+                all_active_members = filtered_members
+                print(f"📊 Filtered to {len(all_active_members)} relevant season ticket members for this route")
+            else:
+                all_active_members = list(self.season_ticket_members.find(query))
             
             if not all_active_members:
                 print("⚠️ No active season ticket members found in database")
@@ -650,6 +697,48 @@ class SimplifiedBusTracker:
             print(f"❌ Error checking season ticket: {e}")
             import traceback
             traceback.print_exc()
+            return None, 0.0
+
+    def check_contractor_match(self, face_embedding, bus_id):
+        """
+        Check if face matches the contractor for THIS BUS
+        
+        Args:
+            face_embedding: Face embedding to match
+            bus_id: Current bus ID
+        
+        Returns:
+            tuple: (contractor, similarity) or (None, 0.0)
+        """
+        try:
+            if not face_embedding or len(face_embedding) == 0:
+                return None, 0.0
+            
+            # Find contractor for this specific bus
+            contractor = self.contractors.find_one({"bus_id": bus_id})
+            
+            if not contractor or not contractor.get('face_embedding'):
+                return None, 0.0
+            
+            print(f"🔍 Checking against contractor for bus {bus_id}: {contractor.get('name')}")
+            
+            # Convert embeddings to numpy arrays
+            input_array = np.array(face_embedding, dtype=np.float32).reshape(1, -1)
+            contractor_array = np.array(contractor['face_embedding'], dtype=np.float32).reshape(1, -1)
+            
+            # Calculate cosine similarity
+            similarity = cosine_similarity(input_array, contractor_array)[0][0]
+            
+            print(f"   👤 Contractor Similarity: {similarity:.4f} (threshold: {self.contractor_similarity_threshold})")
+            
+            if similarity > self.contractor_similarity_threshold:
+                print(f"✅ Contractor Match Found: {contractor['name']}")
+                return contractor, similarity
+            
+            return None, similarity
+            
+        except Exception as e:
+            print(f"❌ Error checking contractor match: {e}")
             return None, 0.0
     
     # Removed: _get_nearby_stops() - Never called
@@ -883,7 +972,7 @@ class SimplifiedBusTracker:
                 }
                 season_member, season_similarity = self.check_season_ticket_member(
                     exit_log['face_embedding'],
-                    bus_route=current_trip.get('trip_id'),
+                    bus_route=current_trip.get('route_name'), # Pass route_name for filtering
                     gps_location=exit_gps_location
                 )
                 
@@ -1010,6 +1099,35 @@ class SimplifiedBusTracker:
         """Process incoming face log entry - supports multiple buses"""
         location_type = log_entry.get('location_type', '').upper()
         bus_id = log_entry.get('bus_id', self.default_bus_id)
+        
+        # 1. Prefer extraction from IMAGE if image_data is provided
+        # This ensures the embedding model matches what was used for Contractor registration
+        image_data = log_entry.get('image_data') or log_entry.get('image')
+        if image_data:
+            print(f"🖼️ Found image_data in log. Extracting fresh embedding for consistency...")
+            try:
+                from face_recognition_helper import extract_face_embedding_from_base64
+                extract_res = extract_face_embedding_from_base64(image_data, draw_boxes=False)
+                if extract_res.get('success') and extract_res.get('face_embedding'):
+                    log_entry['face_embedding'] = extract_res['face_embedding']
+                    print(f"✅ Successfully extracted fresh embedding from image ({extract_res.get('is_mock', False) and 'MOCK' or 'REAL'})")
+            except Exception as e:
+                print(f"⚠️ Failed to extract embedding from image_data: {e}")
+
+        face_embedding = log_entry.get('face_embedding', [])
+
+        # FIRST: Check if this is the CONTRACTOR for this bus
+        contractor, contractor_sim = self.check_contractor_match(face_embedding, bus_id)
+        if contractor:
+            print(f"🛡️ CONTRACTOR DETECTED: {contractor['name']} at {location_type} on {bus_id}. Skipping processing.")
+            return {
+                'action': 'ignored_contractor',
+                'contractor_name': contractor['name'],
+                'bus_id': bus_id,
+                'face_id': log_entry.get('face_id', 0),
+                'similarity': float(contractor_sim),
+                'message': f'🛡️ Contractor {contractor["name"]} matched. Ignored.'
+            }
         
         if location_type == 'ENTRY':
             # Store temporary entry
