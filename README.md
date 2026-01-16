@@ -40,7 +40,7 @@ python simplified_bus_server.py
 5. Deploy!
 
 Railway will automatically:
-- Install all dependencies (including dlib)
+- Install all dependencies (including onnxruntime)
 - Set the PORT environment variable
 - Start the server
 

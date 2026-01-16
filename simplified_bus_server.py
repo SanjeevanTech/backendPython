@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from sklearn.metrics.pairwise import cosine_similarity
 from pymongo import MongoClient
 from bson import ObjectId
+import threading
 
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(__file__))
@@ -99,7 +100,7 @@ class SimplifiedBusTracker:
                 self.route_detector = None
             
             # Initialize contractor similarity threshold
-            self.contractor_similarity_threshold = 0.70  # Decreased from 0.75 for better matching consistency
+            self.contractor_similarity_threshold = 0.65  # Matched with season ticket threshold for consistency
             
             # Don't auto-load trip on startup - trips are created on-demand per bus
             
@@ -628,8 +629,8 @@ class SimplifiedBusTracker:
                             is_relevant = True
                             break
                         
-                        # Case 3: No patterns defined, butlocations match
-                        if not patterns and (from_l in bus_route.lower() or to_l in bus_route.lower()):
+                        # Case 3: No patterns defined - Include for check (let RouteDetector validate later)
+                        if not patterns:
                             is_relevant = True
                             break
                     
@@ -670,6 +671,27 @@ class SimplifiedBusTracker:
                 all_similarities.append((member_name, member_id, similarity))
                 
                 print(f"   n {member_name} ({member_id}): similarity = {similarity:.4f} (threshold: {self.season_ticket_similarity_threshold})", flush=True)
+                
+                # --- AUTO-SYNC LOGIC ---
+                # If similarity is low but this member needs a hardware sync (Dlib -> ESP-WHO)
+                if similarity <= self.season_ticket_similarity_threshold:
+                    if member.get('needs_hardware_sync', True):
+                        print(f"   [SYNC] Hardware Sync PENDING for {member_name}. Transitioning Dlib -> ESP-WHO...", flush=True)
+                        
+                        self.season_ticket_members.update_one(
+                            {"member_id": member_id},
+                            {
+                                "$set": {
+                                  "face_embedding": face_embedding,
+                                  "embedding_size": len(face_embedding),
+                                  "needs_hardware_sync": False,
+                                  "last_synced": datetime.now()
+                                }
+                            }
+                        )
+                        print(f"   [OK] {member_name} successfully synced with ESP32 model!", flush=True)
+                        return member, 1.0 # Treat as match
+                # ----------------------
                 
                 if similarity > best_similarity:
                     best_similarity = similarity
@@ -861,7 +883,7 @@ class SimplifiedBusTracker:
             }
             season_member, season_similarity = self.check_season_ticket_member(
                 log_entry.get('face_embedding', []),
-                bus_route=current_trip.get('trip_id'),  # Use trip_id as route identifier
+                bus_route=current_trip.get('route_name'),  # Use route_name for filtering (was trip_id)
                 gps_location=gps_location
             )
             
@@ -1951,6 +1973,52 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
     # DELETE handler removed - Not needed for ESP32 endpoints
     # All CRUD operations moved to Node.js backend
 
+def run_background_checks():
+    """Background thread to check for expired trips and clean up temp entries"""
+    print("[BG] Starting background trip monitor...", flush=True)
+    while True:
+        try:
+            time.sleep(60) # Check every minute
+            
+            # Iterate through all buses with active trips
+            active_buses = list(bus_tracker.current_trips.keys())
+            
+            if not active_buses:
+                continue
+                
+            current_time = datetime.now()
+            current_hhmm = current_time.strftime("%H:%M")
+            
+            for bus_id in active_buses:
+                # Check if this bus should still be active according to schedule
+                is_active_time = False
+                
+                if schedule_manager:
+                    # Get fresh windows from DB/Schedule Manager
+                    windows = schedule_manager.get_todays_trip_windows(bus_id)
+                    
+                    if not windows:
+                        # If no windows at all today, trip shouldn't be active? 
+                        # Or maybe it's a manual trip. 
+                        # For safety, if we have an active trip but no schedule, we might let it run 
+                        # UNLESS we want to enforce strictly.
+                        # Giving benefit of doubt for manual trips:
+                        pass 
+                    
+                    for window in windows:
+                        if bus_tracker.is_within_trip_schedule(current_hhmm, window['start_time'], window['end_time']):
+                            is_active_time = True
+                            break
+                    
+                    # If we checked windows and none matched, then we should end the trip
+                    if windows and not is_active_time:
+                        print(f"[BG] Auto-ending trip for {bus_id} - Outside schedule (checked {len(windows)} windows)", flush=True)
+                        bus_tracker.end_current_trip(bus_id=bus_id)
+                        
+        except Exception as e:
+            print(f"[BG] Error in background monitor: {e}", flush=True)
+            # Don't crash the thread
+
 def run_server(port=None):
     """Run the ESP32 processing backend"""
     # Use environment variable PORT for production deployment
@@ -1968,6 +2036,10 @@ def run_server(port=None):
     print(f" Server running on port {port}", flush=True)
     print(f"Press Ctrl+C to stop the server", flush=True)
     print(f"{'='*70}\n", flush=True)
+    
+    # Start background monitor
+    monitor_thread = threading.Thread(target=run_background_checks, daemon=True)
+    monitor_thread.start()
     
     try:
         httpd.serve_forever()

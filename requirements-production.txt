@@ -1,5 +1,5 @@
-# Production Dependencies (without heavy face recognition libraries)
-# Face recognition is handled by ESP32 devices, not the server
+# Production Dependencies
+# Face recognition uses ONNX Runtime (MobileFaceNet) for ESP32 compatibility
 
 # Core dependencies
 pymongo==4.6.0

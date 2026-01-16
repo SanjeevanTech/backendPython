@@ -13,5 +13,4 @@ onnxruntime==1.16.1         # ONNX Runtime for model inference
 opencv-python-headless==4.8.1.78 # Image processing without GUI
 pillow==10.0.1              # Image manipulation
 
-# NOTE: For Season Ticket registration via web interface, face-recognition is needed
-# For ESP32 device entry/exit logs, face recognition is handled by ESP32 devices
+

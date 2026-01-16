@@ -356,17 +356,44 @@ class RouteDetector:
                                 
                                 entry_name = entry_stop.get('stop_name', '').lower()
                                 exit_name = exit_stop.get('stop_name', '').lower()
+
+                                # Check if entry/exit match member's from/to locations OR are a SUBSET of the valid route
+                                # Logic: Find indices of ticket_from and ticket_to on this route
+                                ticket_from_index = -1
+                                ticket_to_index = -1
                                 
-                                # Check if entry/exit match member's from/to locations
+                                # Search for ticket stops in the route's stop list
+                                for s in stops:
+                                    s_name = s.get('stop_name', '').lower()
+                                    if from_loc in s_name:
+                                        ticket_from_index = s.get('stop_order', 0)
+                                    if to_loc in s_name:
+                                        ticket_to_index = s.get('stop_order', 0)
+                                
+                                # If we found both ticket boundaries on this route
+                                if ticket_from_index != -1 and ticket_to_index != -1:
+                                    # Ensure ticket direction matches journey direction
+                                    if ticket_from_index < ticket_to_index:
+                                        # Validate: Ticket Start <= Entry <= Exit <= Ticket End
+                                        is_subset_valid = (ticket_from_index <= entry_order) and (exit_order <= ticket_to_index)
+                                        
+                                        if is_subset_valid:
+                                            return True, {
+                                                'match_type': 'route_stops_subset',
+                                                'route_name': route.get('route_name'),
+                                                'ticket_range': f"{from_loc} -> {to_loc}",
+                                                'journey_range': f"{entry_name} -> {exit_name}",
+                                                'note': 'Valid season ticket journey (subset)'
+                                            }
+                                
+                                # Fallback: exact string matching (old logic)
                                 if from_loc in entry_name and to_loc in exit_name:
                                     return True, {
-                                        'match_type': 'route_stops',
+                                        'match_type': 'route_stops_exact',
                                         'route_name': route.get('route_name'),
                                         'entry_stop': entry_stop.get('stop_name'),
                                         'exit_stop': exit_stop.get('stop_name'),
-                                        'entry_order': entry_order,
-                                        'exit_order': exit_order,
-                                        'note': f'Valid partial route: {entry_stop.get("stop_name")}  {exit_stop.get("stop_name")}'
+                                        'note': 'Valid season ticket journey (exact match)'
                                     }
         except Exception as e:
             print(f"   [WARN] Error checking route stops: {e}", flush=True)
