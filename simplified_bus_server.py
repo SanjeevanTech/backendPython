@@ -85,26 +85,26 @@ class SimplifiedBusTracker:
             self.season_ticket_members.create_index([("is_active", 1), ("valid_from", 1), ("valid_until", 1)])
             self.contractors.create_index([("bus_id", 1)], unique=True)
             
-            print("✅ Connected to MongoDB - Multi-Bus Tracking Enabled")
-            print(f"🚌 Default Bus: {self.default_bus_id} ({self.route_name})")
-            print(f"🔄 Multi-bus: Trips are created per bus_id from ESP32 requests")
-            print(f"📊 Collections: temp_entries, busPassengerList, unmatchedPassengers, tripSessions, seasonTicketMembers")
+            print("[OK] Connected to MongoDB - Multi-Bus Tracking Enabled", flush=True)
+            print(f"[BUS] Default Bus: {self.default_bus_id} ({self.route_name})", flush=True)
+            print(f"[SYNC] Multi-bus: Trips are created per bus_id from ESP32 requests", flush=True)
+            print(f"[STATS] Collections: temp_entries, busPassengerList, unmatchedPassengers, tripSessions, seasonTicketMembers", flush=True)
             
             # Initialize route detector
             try:
                 self.route_detector = RouteDetector(self.db)
-                print("✅ Route detector initialized")
+                print("[OK] Route detector initialized", flush=True)
             except Exception as e:
-                print(f"⚠️ Route detector initialization failed: {e}")
+                print(f"[WARN] Route detector initialization failed: {e}", flush=True)
                 self.route_detector = None
             
             # Initialize contractor similarity threshold
-            self.contractor_similarity_threshold = 0.75  # Slightly higher for security
+            self.contractor_similarity_threshold = 0.70  # Decreased from 0.75 for better matching consistency
             
             # Don't auto-load trip on startup - trips are created on-demand per bus
             
         except Exception as e:
-            print(f"❌ Failed to connect to MongoDB: {e}")
+            print(f"[ERROR] Failed to connect to MongoDB: {e}", flush=True)
             raise
     
     def generate_trip_id(self, start_time=None, bus_id=None):
@@ -121,7 +121,7 @@ class SimplifiedBusTracker:
         """Safely parse timestamp, handling invalid/epoch timestamps from ESP32"""
         try:
             if not timestamp_str:
-                print(f"⚠️ Empty timestamp, using server time")
+                print(f"[WARN] Empty timestamp, using server time", flush=True)
                 return datetime.now()
             
             # Handle timezone format: replace +00:00 with Z for fromisoformat compatibility
@@ -132,17 +132,17 @@ class SimplifiedBusTracker:
             
             # Check if timestamp is before 2020 (likely unsynced ESP32 time)
             if parsed_time.year < 2020:
-                print(f"⚠️ Invalid timestamp detected (ESP32 time not synced): {timestamp_str}, using server time")
+                print(f"[WARN] Invalid timestamp detected (ESP32 time not synced): {timestamp_str}, using server time", flush=True)
                 return datetime.now()
             
             # Remove timezone info to store as naive datetime (MongoDB compatibility)
             if parsed_time.tzinfo is not None:
                 parsed_time = parsed_time.replace(tzinfo=None)
             
-            print(f"✅ Parsed timestamp: {timestamp_str} → {parsed_time}")
+            print(f"[OK] Parsed timestamp: {timestamp_str} -> {parsed_time}", flush=True)
             return parsed_time
         except Exception as e:
-            print(f"⚠️ Error parsing timestamp '{timestamp_str}': {e}, using server time")
+            print(f"[WARN] Error parsing timestamp '{timestamp_str}': {e}, using server time", flush=True)
             return datetime.now()
     
     def load_current_trip(self, bus_id=None):
@@ -165,12 +165,12 @@ class SimplifiedBusTracker:
                     'status': 'active',
                     '_id': active_trip['_id']
                 }
-                print(f"📍 Loaded active trip for {bus_id}: {active_trip['trip_id']}")
+                print(f"[LOC] Loaded active trip for {bus_id}: {active_trip['trip_id']}", flush=True)
             else:
                 # Auto-start new trip for this bus
                 self.start_new_trip(bus_id=bus_id)
         except Exception as e:
-            print(f"❌ Error loading trip for {bus_id}: {e}")
+            print(f"[ERROR] Error loading trip for {bus_id}: {e}", flush=True)
             self.start_new_trip(bus_id=bus_id)
     
     def get_current_trip_for_bus(self, bus_id):
@@ -203,7 +203,7 @@ class SimplifiedBusTracker:
                 route_info = self.route_detector.detect_route_direction(bus_id, initial_gps, start_time)
                 if route_info:
                     detected_route = route_info['route_name']
-                    print(f"🛣️ Auto-detected route for {bus_id}: {detected_route}")
+                    print(f"[ROUTE] Auto-detected route for {bus_id}: {detected_route}", flush=True)
             
             # Create trip session record
             trip_session = {
@@ -231,10 +231,10 @@ class SimplifiedBusTracker:
                 '_id': result.inserted_id
             }
             
-            print(f"🚌 Started new trip for {bus_id}: {trip_id}")
+            print(f"[BUS] Started new trip for {bus_id}: {trip_id}", flush=True)
             return trip_id
         except Exception as e:
-            print(f"❌ Error starting trip for {bus_id}: {e}")
+            print(f"[ERROR] Error starting trip for {bus_id}: {e}", flush=True)
             return None
     
     def end_current_trip(self, bus_id=None):
@@ -244,7 +244,7 @@ class SimplifiedBusTracker:
         try:
             current_trip = self.current_trips.get(bus_id)
             if not current_trip:
-                print(f"❌ No active trip for {bus_id}")
+                print(f"[ERROR] No active trip for {bus_id}", flush=True)
                 return False
             
             trip_id = current_trip['trip_id']
@@ -258,7 +258,7 @@ class SimplifiedBusTracker:
                 "bus_id": bus_id
             }))
             
-            print(f"🔍 Found {len(remaining)} unmatched ENTRY records for {bus_id}")
+            print(f"[SEARCH] Found {len(remaining)} unmatched ENTRY records for {bus_id}", flush=True)
             
             unmatched_count = 0
             for entry in remaining:
@@ -279,11 +279,11 @@ class SimplifiedBusTracker:
                 }
                 self.unmatched_passengers.insert_one(unmatched_entry)
                 unmatched_count += 1
-                print(f"   ➡️ Moved ENTRY face_id={entry.get('face_id')} to unmatchedPassengers")
+                print(f"   -> Moved ENTRY face_id={entry.get('face_id')} to unmatchedPassengers", flush=True)
             
             # Delete temp entries for this trip to prevent carryover to next trip
             deleted_count = self.temp_entries.delete_many({"trip_id": trip_id}).deleted_count
-            print(f"🗑️ Deleted {deleted_count} temp_entries for trip {trip_id}")
+            print(f"[DEL] Deleted {deleted_count} temp_entries for trip {trip_id}", flush=True)
             
             # Update trip session
             self.trip_sessions.update_one(
@@ -298,14 +298,14 @@ class SimplifiedBusTracker:
                 }
             )
             
-            print(f"✅ Ended trip for {bus_id}: {trip_id}")
-            print(f"   Passengers: {passenger_count}, Unmatched: {unmatched_count}")
+            print(f"[OK] Ended trip for {bus_id}: {trip_id}", flush=True)
+            print(f"   Passengers: {passenger_count}, Unmatched: {unmatched_count}", flush=True)
             
             # Remove from current trips
             del self.current_trips[bus_id]
             return True
         except Exception as e:
-            print(f"❌ Error ending trip for {bus_id}: {e}")
+            print(f"[ERROR] Error ending trip for {bus_id}: {e}", flush=True)
             return False
     
     # Removed: get_current_route_info() - Replaced by DynamicScheduleManager
@@ -358,7 +358,7 @@ class SimplifiedBusTracker:
                 }
             return None
         except Exception as e:
-            print(f"❌ Error getting trip for {bus_id}: {e}")
+            print(f"[ERROR] Error getting trip for {bus_id}: {e}", flush=True)
             return None
     
     def get_all_trips(self, limit=10, bus_id=None):
@@ -372,7 +372,7 @@ class SimplifiedBusTracker:
             
             return trips
         except Exception as e:
-            print(f"❌ Error getting trips: {e}")
+            print(f"[ERROR] Error getting trips: {e}", flush=True)
             return []
     
     def generate_passenger_id(self):
@@ -397,7 +397,7 @@ class SimplifiedBusTracker:
             
             return c * r
         except Exception as e:
-            print(f"❌ Error calculating Haversine distance: {e}")
+            print(f"[ERROR] Error calculating Haversine distance: {e}", flush=True)
             return 0.0
     
     def calculate_road_distance_osrm(self, start_lat, start_lon, end_lat, end_lon):
@@ -426,11 +426,11 @@ class SimplifiedBusTracker:
                         'success': True
                     }
             
-            print(f"❌ OSRM API error: {response.status_code} - {response.text}")
+            print(f"[ERROR] OSRM API error: {status_code} - {text}", flush=True)
             return None
             
         except Exception as e:
-            print(f"❌ Error with OSRM API: {e}")
+            print(f"[ERROR] Error with OSRM API: {e}", flush=True)
             return None
     
     # Removed: calculate_road_distance_openrouteservice() - Unused, OSRM is default
@@ -452,7 +452,7 @@ class SimplifiedBusTracker:
             result = self.calculate_road_distance_osrm(start_lat, start_lon, end_lat, end_lon)
             
             if not result:
-                print(f"⚠️ OSRM failed. No road distance available. Journey may be inaccurately priced.")
+                print(f"[WARN] OSRM failed. No road distance available. Journey may be inaccurately priced.", flush=True)
                 return {
                     'distance_km': 0.0,
                     'duration_minutes': 0.0,
@@ -464,7 +464,7 @@ class SimplifiedBusTracker:
             return result
             
         except Exception as e:
-            print(f"❌ Error calculating road distance: {e}")
+            print(f"[ERROR] Error calculating road distance: {e}", flush=True)
             return None
     
     def reverse_geocode(self, lat, lon):
@@ -512,11 +512,11 @@ class SimplifiedBusTracker:
                 
                 return location_name
             else:
-                print(f"⚠️ Geocoding failed: HTTP {response.status_code}")
+                print(f"[WARN] Geocoding failed: HTTP {response.status_code}", flush=True)
                 return None
                 
         except Exception as e:
-            print(f"⚠️ Reverse geocoding error: {e}")
+            print(f"[WARN] Reverse geocoding error: {e}", flush=True)
             return None
     
     def calculate_fare(self, distance_km):
@@ -527,7 +527,7 @@ class SimplifiedBusTracker:
             
             # If distance is less than 100 meters (0.1 km), set price to 0
             if distance_km < 0.1:
-                print(f"⚠️ Distance too short ({distance_km} km < 100m), setting price to 0")
+                print(f"[WARN] Distance too short ({distance_km} km < 100m), setting price to 0", flush=True)
                 return 0.0
             
             # Calculate stage number (2 km per stage - official Sri Lankan bus fare system)
@@ -562,14 +562,14 @@ class SimplifiedBusTracker:
                 return float(highest_stage['fare'])
             
             # Final fallback: use old hardcoded calculation
-            print(f"⚠️ No fare stages found in database, using fallback calculation")
+            print(f"[WARN] No fare stages found in database, using fallback calculation", flush=True)
             if stage_number == 1:
                 return 30.0
             else:
                 return 30.0 + ((stage_number - 1) * 10.0)
             
         except Exception as e:
-            print(f"❌ Error calculating fare: {e}")
+            print(f"[ERROR] Error calculating fare: {e}", flush=True)
             return 0.0
     
     def check_season_ticket_member(self, face_embedding, bus_route=None, gps_location=None):
@@ -586,7 +586,7 @@ class SimplifiedBusTracker:
         """
         try:
             if not face_embedding or len(face_embedding) == 0:
-                print("⚠️ No face embedding provided for season ticket check")
+                print("[WARN] No face embedding provided for season ticket check", flush=True)
                 return None, 0.0
             
             now = datetime.now()
@@ -603,7 +603,7 @@ class SimplifiedBusTracker:
             # This implements the user's request: "only check if bus has this waypoint"
             if bus_route:
                 # We assume bus_route passed here is the route_name (e.g., "Jaffna-Colombo")
-                print(f"🛤️ Filtering season tickets for route: {bus_route}")
+                print(f" Filtering season tickets for route: {bus_route}", flush=True)
                 # Check if member's valid_routes patterns match this bus route
                 # or if the bus route name contains member's from/to locations
                 # We'll fetch all and filter in Python for complex pattern logic
@@ -637,19 +637,19 @@ class SimplifiedBusTracker:
                         filtered_members.append(m)
                 
                 all_active_members = filtered_members
-                print(f"📊 Filtered to {len(all_active_members)} relevant season ticket members for this route")
+                print(f"[STATS] Filtered to {len(all_active_members)} relevant season ticket members for this route", flush=True)
             else:
                 all_active_members = list(self.season_ticket_members.find(query))
             
             if not all_active_members:
-                print("⚠️ No active season ticket members found in database")
+                print("[WARN] No active season ticket members found in database", flush=True)
                 return None, 0.0
             
-            print(f"🔍 Checking against {len(all_active_members)} active season ticket members")
+            print(f"[SEARCH] Checking against {len(all_active_members)} active season ticket members", flush=True)
             
             # Convert input embedding to numpy array
             input_array = np.array(face_embedding, dtype=np.float32).reshape(1, -1)
-            print(f"📊 Input embedding size: {input_array.shape}")
+            print(f"[STATS] Input embedding size: {input_array.shape}", flush=True)
             
             best_match = None
             best_similarity = 0.0
@@ -669,7 +669,7 @@ class SimplifiedBusTracker:
                 similarity = cosine_similarity(input_array, member_array)[0][0]
                 all_similarities.append((member_name, member_id, similarity))
                 
-                print(f"   �n {member_name} ({member_id}): similarity = {similarity:.4f} (threshold: {self.season_ticket_similarity_threshold})")
+                print(f"   n {member_name} ({member_id}): similarity = {similarity:.4f} (threshold: {self.season_ticket_similarity_threshold})", flush=True)
                 
                 if similarity > best_similarity:
                     best_similarity = similarity
@@ -677,23 +677,23 @@ class SimplifiedBusTracker:
                         best_match = member
             
             # Print summary
-            print(f"\n📊 Season Ticket Check Summary:")
-            print(f"   Best similarity: {best_similarity:.4f}")
-            print(f"   Threshold: {self.season_ticket_similarity_threshold}")
-            print(f"   Match found: {'YES ✅' if best_match else 'NO ❌'}")
+            print(f"\n[OK] Season Ticket Check Summary:", flush=True)
+            print(f"   Best similarity: {best_similarity:.4f}", flush=True)
+            print(f"   Threshold: {self.season_ticket_similarity_threshold}", flush=True)
+            print(f"   Match found: {'YES [OK]' if best_match else 'NO [ERROR]'}", flush=True)
             
             if best_match:
-                print(f"🎫 Season ticket member detected: {best_match['name']} (similarity: {best_similarity:.3f})")
+                print(f"[TICKET] Season ticket member detected: {best_match['name']} (similarity: {best_similarity:.3f})", flush=True)
                 return best_match, best_similarity
             else:
                 if best_similarity > 0:
-                    print(f"⚠️ Closest match was {best_similarity:.4f}, below threshold {self.season_ticket_similarity_threshold}")
-                    print(f"💡 TIP: Consider lowering season_ticket_similarity_threshold if this is a valid member")
+                    print(f"[WARN] Closest match was {best_similarity:.4f}, below threshold {self.season_ticket_similarity_threshold}", flush=True)
+                    print(f" TIP: Consider lowering season_ticket_similarity_threshold if this is a valid member", flush=True)
             
             return None, 0.0
             
         except Exception as e:
-            print(f"❌ Error checking season ticket: {e}")
+            print(f"[ERROR] Error checking season ticket: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None, 0.0
@@ -719,7 +719,8 @@ class SimplifiedBusTracker:
             if not contractor or not contractor.get('face_embedding'):
                 return None, 0.0
             
-            print(f"🔍 Checking against contractor for bus {bus_id}: {contractor.get('name')}")
+            print(f"[SEARCH] Checking against contractor for bus {bus_id}: {contractor.get('name')}", flush=True)
+            print(f"   [DEBUG] Incoming embedding size: {len(face_embedding)}", flush=True)
             
             # Convert embeddings to numpy arrays
             input_array = np.array(face_embedding, dtype=np.float32).reshape(1, -1)
@@ -728,16 +729,37 @@ class SimplifiedBusTracker:
             # Calculate cosine similarity
             similarity = cosine_similarity(input_array, contractor_array)[0][0]
             
-            print(f"   👤 Contractor Similarity: {similarity:.4f} (threshold: {self.contractor_similarity_threshold})")
+            print(f"   [USER] Contractor Similarity: {similarity:.4f} (threshold: {self.contractor_similarity_threshold})", flush=True)
             
+            # --- AUTO-SYNC LOGIC ---
+            # If similarity is failing (Dlib vs ESP mismatch) but a sync is pending
+            if similarity <= self.contractor_similarity_threshold:
+                if contractor.get('needs_hardware_sync', True):
+                    print(f"   [SYNC] Hardware Sync PENDING for {contractor['name']}. Transitioning Dlib -> ESP-WHO...", flush=True)
+                    
+                    self.contractors.update_one(
+                        {"bus_id": bus_id},
+                        {
+                            "$set": {
+                                "face_embedding": face_embedding,
+                                "embedding_size": len(face_embedding),
+                                "needs_hardware_sync": False,
+                                "last_synced": datetime.now()
+                            }
+                        }
+                    )
+                    print(f"   [OK] {contractor['name']} successfully synced with ESP32 model! Future matches will be 100%.", flush=True)
+                    return contractor, 1.0 # Treat this capture as a successful match
+            # ----------------------
+
             if similarity > self.contractor_similarity_threshold:
-                print(f"✅ Contractor Match Found: {contractor['name']}")
+                print(f"[OK] Contractor Match Found: {contractor['name']}", flush=True)
                 return contractor, similarity
             
             return None, similarity
             
         except Exception as e:
-            print(f"❌ Error checking contractor match: {e}")
+            print(f"[ERROR] Error checking contractor match: {e}", flush=True)
             return None, 0.0
     
     # Removed: _get_nearby_stops() - Never called
@@ -749,7 +771,7 @@ class SimplifiedBusTracker:
         try:
             if not member.get('valid_routes') or len(member['valid_routes']) == 0:
                 # No route restrictions - valid everywhere
-                print("✅ No route restrictions - valid everywhere")
+                print("[OK] No route restrictions - valid everywhere", flush=True)
                 return True, None
             
             entry_lat = entry_location.get('latitude')
@@ -759,15 +781,15 @@ class SimplifiedBusTracker:
             
             # Validate GPS coordinates
             if not all([entry_lat, entry_lon, exit_lat, exit_lon]):
-                print("⚠️ Missing GPS coordinates, falling back to route name matching")
+                print("[WARN] Missing GPS coordinates, falling back to route name matching", flush=True)
                 # Fallback to old method if GPS not available
                 return self._fallback_route_validation(member)
             
             # Use route detector if available
             if self.route_detector:
-                print(f"🗺️ Using GPS-based route detection")
-                print(f"   Entry: {entry_lat}, {entry_lon}")
-                print(f"   Exit: {exit_lat}, {exit_lon}")
+                print(f"[MAP] Using GPS-based route detection", flush=True)
+                print(f"   Entry: {entry_lat}, {entry_lon}", flush=True)
+                print(f"   Exit: {exit_lat}, {exit_lon}", flush=True)
                 
                 is_valid, match_info = self.route_detector.find_matching_season_ticket_routes(
                     entry_lat, entry_lon,
@@ -776,18 +798,18 @@ class SimplifiedBusTracker:
                 )
                 
                 if is_valid:
-                    print(f"✅ GPS-based validation: Journey matches {match_info.get('matched_route')}")
+                    print(f"[OK] GPS-based validation: Journey matches {match_info.get('matched_route')}", flush=True)
                     return True, match_info
                 else:
-                    print(f"❌ GPS-based validation: {match_info.get('reason')}")
+                    print(f"[ERROR] GPS-based validation: {match_info.get('reason')}", flush=True)
                     return False, match_info
             else:
                 # Fallback if route detector not available
-                print("⚠️ Route detector not available, using fallback")
+                print("[WARN] Route detector not available, using fallback", flush=True)
                 return self._fallback_route_validation(member)
             
         except Exception as e:
-            print(f"❌ Error checking route validity: {e}")
+            print(f"[ERROR] Error checking route validity: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return False, None
@@ -803,19 +825,19 @@ class SimplifiedBusTracker:
                     to_loc = valid_route.get('to_location', '').lower()
                     
                     if from_loc in self.route_name.lower() and to_loc in self.route_name.lower():
-                        print(f"✅ Fallback: Route {self.route_name} matches {from_loc} → {to_loc}")
+                        print(f"[OK] Fallback: Route {self.route_name} matches {from_loc}  {to_loc}", flush=True)
                         return True, valid_route
                 else:
                     for pattern in route_patterns:
                         if pattern.lower() in self.route_name.lower() or self.route_name.lower() in pattern.lower():
-                            print(f"✅ Fallback: Route {self.route_name} matches pattern {pattern}")
+                            print(f"[OK] Fallback: Route {self.route_name} matches pattern {pattern}", flush=True)
                             return True, valid_route
             
-            print(f"❌ Fallback: Route {self.route_name} not in member's valid routes")
+            print(f"[ERROR] Fallback: Route {self.route_name} not in member's valid routes", flush=True)
             return False, None
             
         except Exception as e:
-            print(f"❌ Error in fallback validation: {e}")
+            print(f"[ERROR] Error in fallback validation: {e}", flush=True)
             return False, None
     
     def store_entry(self, log_entry):
@@ -827,7 +849,7 @@ class SimplifiedBusTracker:
             # Ensure we have an active trip for this bus
             current_trip = self.get_current_trip_for_bus(bus_id)
             if not current_trip or current_trip.get('status') != 'active':
-                print(f"⚠️ No active trip for {bus_id}, starting new trip...")
+                print(f"[WARN] No active trip for {bus_id}, starting new trip...", flush=True)
                 self.start_new_trip(bus_id=bus_id)
                 current_trip = self.current_trips.get(bus_id)
             
@@ -850,7 +872,7 @@ class SimplifiedBusTracker:
                     "member_name": season_member['name'],
                     "similarity_score": float(season_similarity)
                 }
-                print(f"🎫 Season ticket member detected at ENTRY on {bus_id}: {season_member['name']}")
+                print(f"[TICKET] Season ticket member detected at ENTRY on {bus_id}: {season_member['name']}", flush=True)
             
             temp_entry = {
                 "trip_id": current_trip['trip_id'],
@@ -872,11 +894,11 @@ class SimplifiedBusTracker:
             }
             
             result = self.temp_entries.insert_one(temp_entry)
-            print(f"✅ Stored entry for {bus_id}: {result.inserted_id} (Trip: {current_trip['trip_id']})")
+            print(f"[OK] Stored entry for {bus_id}: {result.inserted_id} (Trip: {current_trip['trip_id']})", flush=True)
             return str(result.inserted_id)
             
         except Exception as e:
-            print(f"❌ Error storing entry: {e}")
+            print(f"[ERROR] Error storing entry: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
@@ -893,7 +915,7 @@ class SimplifiedBusTracker:
             # Ensure we have an active trip for this bus
             current_trip = self.get_current_trip_for_bus(bus_id)
             if not current_trip or current_trip.get('status') != 'active':
-                print(f"⚠️ No active trip for {bus_id} for exit matching")
+                print(f"[WARN] No active trip for {bus_id} for exit matching", flush=True)
                 return None, 0.0
             
             # Calculate time threshold for matching window
@@ -908,24 +930,24 @@ class SimplifiedBusTracker:
             }
             
             # DEBUG: Print query to verify bus_id filtering
-            print(f"🔎 Query for matching: bus_id={bus_id}, trip_id={current_trip['trip_id']}")
+            print(f" Query for matching: bus_id={bus_id}, trip_id={current_trip['trip_id']}", flush=True)
             
             unmatched_entries = self.temp_entries.find(query).sort("entry_timestamp", -1)
             
             entries_list = list(unmatched_entries)
-            print(f"🔍 Found {len(entries_list)} entries for {bus_id} (Trip: {current_trip['trip_id']})")
+            print(f"[SEARCH] Found {len(entries_list)} entries for {bus_id} (Trip: {current_trip['trip_id']})", flush=True)
             
             # DEBUG: Show which bus_ids are in the results
             if entries_list:
                 found_bus_ids = set(e.get('bus_id', 'UNKNOWN') for e in entries_list)
-                print(f"   Bus IDs in results: {found_bus_ids}")
+                print(f"   Bus IDs in results: {found_bus_ids}", flush=True)
             
             if not entries_list:
-                print(f"❌ No unmatched entries found for bus {bus_id}")
-                print(f"   Time threshold: {time_threshold}")
+                print(f"[ERROR] No unmatched entries found for bus {bus_id}", flush=True)
+                print(f"   Time threshold: {time_threshold}", flush=True)
                 return None, 0.0
             
-            print(f"🔍 Checking {len(entries_list)} entries for similarity")
+            print(f"[SEARCH] Checking {len(entries_list)} entries for similarity", flush=True)
             
             # Convert exit embedding to numpy array
             exit_array = np.array(exit_log['face_embedding'], dtype=np.float32).reshape(1, -1)
@@ -943,13 +965,13 @@ class SimplifiedBusTracker:
                 # Calculate cosine similarity
                 similarity = cosine_similarity(exit_array, entry_array)[0][0]
                 
-                print(f"  Entry {entry['_id']}: similarity = {similarity:.3f} (threshold: {self.similarity_threshold})")
+                print(f"  Entry {entry['_id']}: similarity = {similarity:.3f} (threshold: {self.similarity_threshold})", flush=True)
                 
                 if similarity > best_similarity and similarity > self.similarity_threshold:
                     best_similarity = similarity
                     best_match = entry
             
-            print(f"🎯 Best match: similarity = {best_similarity:.3f}")
+            print(f" Best match: similarity = {best_similarity:.3f}", flush=True)
             
             if best_match:
                 # Create final passenger record
@@ -1003,7 +1025,7 @@ class SimplifiedBusTracker:
                             "similarity_score": float(season_similarity),
                             "valid_route": valid_route
                         }
-                        print(f"🎫 Season ticket applied: {season_member['name']} - Price: ₹0")
+                        print(f"[TICKET] Season ticket applied: {season_member['name']} - Price: 0", flush=True)
                         
                         # Update member statistics
                         self.season_ticket_members.update_one(
@@ -1017,7 +1039,7 @@ class SimplifiedBusTracker:
                         # Season ticket not valid for this route - calculate normal price
                         distance_km = distance_info.get('distance_km', 0) if distance_info else 0
                         price = self.calculate_fare(distance_km)
-                        print(f"⚠️ Season ticket not valid for route {self.route_name} - Charging normal price: ₹{price}")
+                        print(f"[WARN] Season ticket not valid for route {self.route_name} - Charging normal price: {price}", flush=True)
                 else:
                     # Regular passenger - calculate normal price
                     distance_km = distance_info.get('distance_km', 0) if distance_info else 0
@@ -1081,17 +1103,17 @@ class SimplifiedBusTracker:
                 # Delete the temporary entry immediately
                 self.temp_entries.delete_one({"_id": best_match['_id']})
                 
-                print(f"✅ Created final passenger: {passenger_id}")
+                print(f"[OK] Created final passenger: {passenger_id}", flush=True)
                 if distance_info and distance_info.get('success'):
-                    print(f"📏 Journey distance: {distance_info['distance_km']} km (estimated {distance_info['duration_minutes']} min)")
-                print(f"🗑️ Deleted temporary entry: {best_match['_id']}")
+                    print(f" Journey distance: {distance_info['distance_km']} km (estimated {distance_info['duration_minutes']} min)", flush=True)
+                print(f"[DEL] Deleted temporary entry: {best_match['_id']}", flush=True)
                 
                 return final_passenger, best_similarity
             
             return None, best_similarity
             
         except Exception as e:
-            print(f"❌ Error finding matching entry: {e}")
+            print(f"[ERROR] Error finding matching entry: {e}", flush=True)
             return None, 0.0
     
     def process_face_log(self, log_entry):
@@ -1103,29 +1125,29 @@ class SimplifiedBusTracker:
         # This ensures the embedding model matches what was used for Contractor registration
         image_data = log_entry.get('image_data') or log_entry.get('image')
         if image_data:
-            print(f"🖼️ Found image_data in log. Extracting fresh embedding for consistency...")
+            print(f" Found image_data in log. Extracting fresh embedding for consistency...", flush=True)
             try:
                 from face_recognition_helper import extract_face_embedding_from_base64
                 extract_res = extract_face_embedding_from_base64(image_data, draw_boxes=False)
                 if extract_res.get('success') and extract_res.get('face_embedding'):
                     log_entry['face_embedding'] = extract_res['face_embedding']
-                    print(f"✅ Successfully extracted fresh embedding from image ({extract_res.get('is_mock', False) and 'MOCK' or 'REAL'})")
+                    print(f"[OK] Successfully extracted fresh embedding from image ({extract_res.get('is_mock', False) and 'MOCK' or 'REAL'})", flush=True)
             except Exception as e:
-                print(f"⚠️ Failed to extract embedding from image_data: {e}")
+                print(f"[WARN] Failed to extract embedding from image_data: {e}", flush=True)
 
         face_embedding = log_entry.get('face_embedding', [])
 
         # FIRST: Check if this is the CONTRACTOR for this bus
         contractor, contractor_sim = self.check_contractor_match(face_embedding, bus_id)
         if contractor:
-            print(f"🛡️ CONTRACTOR DETECTED: {contractor['name']} at {location_type} on {bus_id}. Skipping processing.")
+            print(f" CONTRACTOR DETECTED: {contractor['name']} at {location_type} on {bus_id}. Skipping processing.", flush=True)
             return {
                 'action': 'ignored_contractor',
                 'contractor_name': contractor['name'],
                 'bus_id': bus_id,
                 'face_id': log_entry.get('face_id', 0),
                 'similarity': float(contractor_sim),
-                'message': f'🛡️ Contractor {contractor["name"]} matched. Ignored.'
+                'message': f' Contractor {contractor["name"]} matched. Ignored.'
             }
         
         if location_type == 'ENTRY':
@@ -1160,7 +1182,7 @@ class SimplifiedBusTracker:
                     'exit_face_id': match_result['exit_face_id'],
                     'similarity': float(similarity),
                     'journey_duration': match_result['journey_duration_minutes'],
-                    'message': f'✅ Journey on {bus_id}! Passenger {match_result["id"]} (similarity: {similarity:.3f}, duration: {match_result["journey_duration_minutes"]:.1f} min)'
+                    'message': f'[OK] Journey on {bus_id}! Passenger {match_result["id"]} (similarity: {similarity:.3f}, duration: {match_result["journey_duration_minutes"]:.1f} min)'
                 }
             else:
                 # Store unmatched exit
@@ -1171,7 +1193,7 @@ class SimplifiedBusTracker:
                     'face_id': log_entry.get('face_id', 0),
                     'best_similarity': float(similarity),
                     'unmatched_id': unmatched_exit_id,
-                    'message': f'❌ No match on {bus_id} for exit face_id {log_entry.get("face_id", 0)} (best: {similarity:.3f})'
+                    'message': f'[ERROR] No match on {bus_id} for exit face_id {log_entry.get("face_id", 0)} (best: {similarity:.3f})'
                 }
         
         else:
@@ -1195,7 +1217,7 @@ class SimplifiedBusTracker:
                 trip_id = current_trip['trip_id']
                 trip_start_time = current_trip['start_time']
             else:
-                print(f"⚠️ No active trip for {bus_id} - storing unmatched exit with FALLBACK trip")
+                print(f"[WARN] No active trip for {bus_id} - storing unmatched exit with FALLBACK trip", flush=True)
                 trip_id = f"FALLBACK_{bus_id}_{datetime.now().strftime('%Y%m%d_%H%M')}"
                 trip_start_time = datetime.utcnow()
             
@@ -1221,11 +1243,11 @@ class SimplifiedBusTracker:
             }
             
             result = self.unmatched_passengers.insert_one(unmatched_exit)
-            print(f"📝 Stored unmatched exit for {bus_id}: {result.inserted_id}")
+            print(f"[LOG] Stored unmatched exit for {bus_id}: {result.inserted_id}", flush=True)
             return str(result.inserted_id)
             
         except Exception as e:
-            print(f"❌ Error storing unmatched exit: {e}")
+            print(f"[ERROR] Error storing unmatched exit: {e}", flush=True)
             return None
     
     def cleanup_old_temp_entries(self, hours_old=24, bus_id=None, trip_id=None):
@@ -1261,7 +1283,7 @@ class SimplifiedBusTracker:
             entries_to_clean = list(self.temp_entries.find(query))
             
             if entries_to_clean:
-                print(f"🔍 Found {len(entries_to_clean)} temp entries to clean" + (f" for {bus_id}" if bus_id else ""))
+                print(f"[SEARCH] Found {len(entries_to_clean)} temp entries to clean" + (f" for {bus_id}" if bus_id else ""), flush=True)
                 
                 for entry in entries_to_clean:
                     entry_bus_id = entry.get('bus_id', self.default_bus_id)
@@ -1281,19 +1303,19 @@ class SimplifiedBusTracker:
                         "created_at": datetime.now()
                     }
                     self.unmatched_passengers.insert_one(unmatched_entry)
-                    print(f"   ➡️ Moved ENTRY face_id={entry.get('face_id')} to unmatchedPassengers")
+                    print(f"   -> Moved ENTRY face_id={entry.get('face_id')} to unmatchedPassengers", flush=True)
                 
                 result = self.temp_entries.delete_many(query)
                 
-                print(f"🗑️ Cleaned up {result.deleted_count} temp entries" + (f" for {bus_id}" if bus_id else ""))
+                print(f"[DEL] Cleaned up {result.deleted_count} temp entries" + (f" for {bus_id}" if bus_id else ""), flush=True)
                 return len(entries_to_clean)
             else:
-                print(f"✅ No temp entries to clean" + (f" for {bus_id}" if bus_id else ""))
+                print(f"[OK] No temp entries to clean" + (f" for {bus_id}" if bus_id else ""), flush=True)
             
             return 0
             
         except Exception as e:
-            print(f"❌ Error during cleanup: {e}")
+            print(f"[ERROR] Error during cleanup: {e}", flush=True)
             return 0
 
     def is_within_trip_schedule(self, current_time_str, trip_start, trip_end):
@@ -1314,7 +1336,7 @@ class SimplifiedBusTracker:
                 return current >= start or current <= end
                 
         except Exception as e:
-            print(f"❌ Error parsing trip schedule: {e}")
+            print(f"[ERROR] Error parsing trip schedule: {e}", flush=True)
             return False
     
     # Removed: get_stats() - Never called, stats handled by Node.js backend
@@ -1326,7 +1348,7 @@ bus_tracker = SimplifiedBusTracker()
 schedule_manager = DynamicScheduleManager()
 schedule_manager.start_scheduler_thread()
 
-print("✅ Using DynamicScheduleManager for automated trip scheduling")
+print("[OK] Using DynamicScheduleManager for automated trip scheduling", flush=True)
 
 # Power Management Functions
 def get_power_config(bus_id):
@@ -1358,20 +1380,20 @@ def get_power_config(bus_id):
                 # Always fetch the latest schedule for THIS specific bus from MongoDB
                 trip_windows = schedule_manager.get_todays_trip_windows(bus_id=bus_id)
                 if trip_windows:
-                    print(f"✅ Injecting {len(trip_windows)} LIVE trip windows for {bus_id}")
+                    print(f"[OK] Injecting {len(trip_windows)} LIVE trip windows for {bus_id}", flush=True)
                     config['trip_windows'] = trip_windows
                     config['use_multi_trip'] = True
                 else:
-                    print(f"ℹ️ No active schedule windows found in MongoDB for {bus_id}")
+                    print(f" No active schedule windows found in MongoDB for {bus_id}", flush=True)
             except Exception as e:
-                print(f"⚠️ Error injecting dynamic schedule for {bus_id}: {e}")
+                print(f"[WARN] Error injecting dynamic schedule for {bus_id}: {e}", flush=True)
         
         # Inject current server time for ESP32 sync
         config['current_server_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         return config
     except Exception as e:
-        print(f"❌ Error getting power config: {e}")
+        print(f"[ERROR] Error getting power config: {e}", flush=True)
         return None
 
 def update_power_config(bus_id, config_data):
@@ -1395,10 +1417,10 @@ def update_power_config(bus_id, config_data):
             upsert=True
         )
         
-        print(f"✅ Power config updated for {bus_id}")
+        print(f"[OK] Power config updated for {bus_id}", flush=True)
         return True
     except Exception as e:
-        print(f"❌ Error updating power config: {e}")
+        print(f"[ERROR] Error updating power config: {e}", flush=True)
         return False
 
 # Removed: update_board_heartbeat() - Not used by ESP32 hardware
@@ -1436,11 +1458,13 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         """Handle GET requests - ESP32 ENDPOINTS ONLY"""
+        client_ip = self.client_address[0]
+        print(f"[IN] [GET] {self.path} from {client_ip}", flush=True)
         # Root status endpoint
         if self.path == '/' or self.path == '/status':
             response = {
                 'status': 'success',
-                'message': '🚌 Python Backend - ESP32 Processing Engine Only',
+                'message': '[BUS] Python Backend - ESP32 Processing Engine Only',
                 'bus_id': bus_tracker.bus_id,
                 'route_name': bus_tracker.route_name,
                 'esp32_endpoints': {
@@ -1561,11 +1585,11 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                         "auto_managed": True if esp32_trip_start and esp32_trip_end else False
                     }
                 
-                print(f"Trip context: {response['trip_status']} | Auto: {response.get('auto_managed', False)}")
+                print(f"Trip context: {response['trip_status']} | Auto: {response.get('auto_managed', False)}", flush=True)
                 self._send_json_response(response)
             except Exception as e:
                 import traceback
-                print(f"ERROR in trip-context: {e}")
+                print(f"ERROR in trip-context: {e}", flush=True)
                 traceback.print_exc()
                 self._send_error_response(f"Trip context error: {str(e)}", 500)
         
@@ -1606,27 +1630,29 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
     
     def do_POST(self):
         """Handle POST requests - ESP32 ENDPOINTS ONLY"""
+        client_ip = self.client_address[0]
+        print(f"[IN] [POST] {self.path} from {client_ip}", flush=True)
         try:
             parsed_path = urlparse(self.path)
             
             # ESP32 Face Embedding Extraction Endpoint
             if parsed_path.path == '/api/extract-face-embedding':
                 content_length = int(self.headers.get('Content-Length', 0))
-                print(f"📸 Incoming face photo: {content_length / 1024:.1f} KB")
+                print(f"[PHOTO] Incoming face photo: {content_length / 1024:.1f} KB", flush=True)
                 
                 # Read data
                 post_data = self.rfile.read(content_length)
-                print(f"📥 Data received, parsing JSON...")
+                print(f"[IN] Data received, parsing JSON...", flush=True)
                 
                 data = json.loads(post_data.decode('utf-8'))
                 image_data = data.get('image_data', '')
-                print(f"🔍 Starting face extraction...")
+                print(f"[SEARCH] Starting face extraction...", flush=True)
                 
                 # Process using the pre-loaded helper
                 try:
                     result = extract_face_embedding_from_base64(image_data)
                 except ImportError:
-                    print("⚠️ face_recognition_helper not found, using fallback")
+                    print("[WARN] face_recognition_helper not found, using fallback", flush=True)
                     # Fallback to mock embedding
                     import hashlib
                     image_hash = hashlib.md5(image_data.encode()).hexdigest()
@@ -1663,15 +1689,15 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 device_id = data.get('device_id', 'UNKNOWN')
                 bus_id = data.get('bus_id', 'UNKNOWN')
                 
-                print(f"💊 ESP32 Health report from {device_id} ({bus_id})")
+                print(f"[HEALTH] ESP32 Health report from {device_id} ({bus_id})", flush=True)
                 
                 # Print key health metrics
                 if 'health' in data:
                     health = data['health']
-                    print(f"   📶 WiFi: {health.get('wifi_status', False)} (RSSI: {health.get('wifi_rssi', 0)})")
-                    print(f"   📷 Camera: {health.get('camera_status', False)}")
-                    print(f"   🛰️ GPS: {health.get('gps_status', False)} ({health.get('gps_satellite_count', 0)} sats)")
-                    print(f"   💾 Memory: {health.get('free_heap_bytes', 0):,} bytes free")
+                    print(f"   [WIFI] WiFi: {health.get('wifi_status', False)} (RSSI: {health.get('wifi_rssi', 0)})", flush=True)
+                    print(f"   [CAM] Camera: {health.get('camera_status', False)}", flush=True)
+                    print(f"   [GPS] GPS: {health.get('gps_status', False)} ({health.get('gps_satellite_count', 0)} sats)", flush=True)
+                    print(f"   [MEM] Memory: {health.get('free_heap_bytes', 0):,} bytes free", flush=True)
                 
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
@@ -1703,11 +1729,11 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 else:
                     location_type = logs[0].get('location_type', 'UNKNOWN') if logs else 'UNKNOWN'
                 
-                print(f"\n🚌 ESP32 Face Detection Data Received")
-                print(f"Bus: {bus_id}")  # MULTI-BUS: Show bus_id
-                print(f"Device: {device_id}")
-                print(f"Type: {location_type}")
-                print(f"Logs: {len(logs)}")
+                print(f"\n[BUS] ESP32 Face Detection Data Received", flush=True)
+                print(f"Bus: {bus_id}", flush=True)  # MULTI-BUS: Show bus_id
+                print(f"Device: {device_id}", flush=True)
+                print(f"Type: {location_type}", flush=True)
+                print(f"Logs: {len(logs)}", flush=True)
                 
                 results = []
                 for i, log in enumerate(logs):
@@ -1715,12 +1741,12 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                     log['location_type'] = location_type
                     log['bus_id'] = bus_id  # MULTI-BUS: Add bus_id to each log
                     
-                    print(f"\n📍 Processing: {location_type} on {bus_id} - Face ID: {log.get('face_id')}")
+                    print(f"\n[LOC] Processing: {location_type} on {bus_id} - Face ID: {log.get('face_id')}", flush=True)
                     
                     # --- VALIDATION: Bus ID and Time ---
                     # 1. Validate Bus ID
                     if not bus_tracker.power_configs.find_one({"bus_id": bus_id}):
-                        print(f"⚠️ REJECTING: Unknown Bus ID {bus_id}")
+                        print(f"[WARN] REJECTING: Unknown Bus ID {bus_id}", flush=True)
                         results.append({"action": "rejected", "message": "Unknown Bus ID"})
                         continue
 
@@ -1728,7 +1754,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                     log_time_str = log.get('timestamp')
                     parsed_time = bus_tracker._parse_timestamp_safe(log_time_str)
                     if parsed_time.year < 2024:
-                        print(f"⚠️ REJECTING: Invalid timestamp {parsed_time} (System time not synced?)")
+                        print(f"[WARN] REJECTING: Invalid timestamp {parsed_time} (System time not synced?)", flush=True)
                         results.append({"action": "rejected", "message": "Invalid Timestamp"})
                         continue
                         
@@ -1748,7 +1774,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                             log_time_hhmm = local_time.strftime("%H:%M")
                             today_name = local_time.strftime('%A').lower()
                             
-                            print(f"⏰ Checking schedule: Log UTC {parsed_time.strftime('%H:%M')} -> Local {log_time_hhmm} vs trips")
+                            print(f"[CLOCK] Checking schedule: Log UTC {parsed_time.strftime('%H:%M')} -> Local {log_time_hhmm} vs trips", flush=True)
                             
                             for trip in schedule_doc.get('trips', []):
                                 if not trip.get('active', True): continue
@@ -1773,23 +1799,23 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                                         is_in_window = True
                                         break
                                 except Exception as e:
-                                    print(f"⚠️ Error parsing schedule window for {bus_id}: {e}")
+                                    print(f"[WARN] Error parsing schedule window for {bus_id}: {e}", flush=True)
                                     continue
                         else:
-                            print(f"⚠️ No active schedule found in MongoDB for bus {bus_id}")
+                            print(f"[WARN] No active schedule found in MongoDB for bus {bus_id}", flush=True)
                     
                     if not is_in_window:
                         check_time = local_time.strftime('%H:%M') if 'local_time' in locals() else parsed_time.strftime('%H:%M')
                         
                         if bus_tracker.debug_allow_all_logs:
-                            print(f"🛠️ DEBUG BYPASS: Log for {bus_id} at {check_time} (Local) accepted despite schedule.")
+                            print(f"[DEBUG] DEBUG BYPASS: Log for {bus_id} at {check_time} (Local) accepted despite schedule.", flush=True)
                             is_in_window = True
                         else:
-                            print(f"❌ REJECTING: Log for {bus_id} at {check_time} (Local) is OUTSIDE scheduled trip hours.")
+                            print(f"[ERROR] REJECTING: Log for {bus_id} at {check_time} (Local) is OUTSIDE scheduled trip hours.", flush=True)
                             results.append({"action": "rejected", "message": f"Outside Scheduled Trip Hours (Log:{check_time})"})
                             continue
                     
-                    print(f"✅ Log accepted: {bus_id} time is within scheduled window")
+                    print(f"[OK] Log accepted: {bus_id} time is within scheduled window", flush=True)
                     # -----------------------------------
 
                     # Process using existing system
@@ -1802,17 +1828,17 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                     lat = log.get('latitude', 0)
                     lon = log.get('longitude', 0)
                     
-                    print(f"   Face {i+1}: ID={face_id}, Time={timestamp}")
+                    print(f"   Face {i+1}: ID={face_id}, Time={timestamp}", flush=True)
                     if lat != 0 or lon != 0:
-                        print(f"           GPS: {lat:.6f}, {lon:.6f}")
+                        print(f"           GPS: {lat:.6f}, {lon:.6f}", flush=True)
                     
                     # Print processing result
                     if result.get('action') == 'matched_journey':
-                        print(f"           ✅ {result['message']}")
+                        print(f"           [OK] {result['message']}", flush=True)
                     elif result.get('action') == 'stored_entry':
-                        print(f"           📝 {result['message']}")
+                        print(f"           [LOG] {result['message']}", flush=True)
                     elif result.get('action') == 'unmatched_exit':
-                        print(f"           ❌ {result['message']}")
+                        print(f"           [ERROR] {result['message']}", flush=True)
                 
                 # Send response
                 self.send_response(200)
@@ -1850,7 +1876,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                     device_id = data.get('device_id', 'UNKNOWN')
                     target_bus_id = data.get('bus_id', bus_tracker.default_bus_id)
                     
-                    print(f"💓 Heartbeat received from {device_id} (Bus: {target_bus_id})")
+                    print(f"[HEART] Heartbeat received from {device_id} (Bus: {target_bus_id})", flush=True)
                     
                     # Update DB with board status
                     try:
@@ -1876,7 +1902,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                         
                         # 2. If not found (matched_count == 0), push new board
                         if result.matched_count == 0:
-                            print(f"➕ Registering new board: {device_id}")
+                            print(f"[ADD] Registering new board: {device_id}", flush=True)
                             bus_tracker.power_configs.update_one(
                                 {"bus_id": target_bus_id},
                                 {
@@ -1896,7 +1922,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                             )
                             
                     except Exception as db_err:
-                        print(f"⚠️ Failed to update board status in DB: {db_err}")
+                        print(f"[WARN] Failed to update board status in DB: {db_err}", flush=True)
 
                     self.send_response(200)
                     self.send_header('Content-type', 'application/json')
@@ -1905,7 +1931,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps(response).encode())
                     return
                 except Exception as e:
-                    print(f"❌ Error processing heartbeat: {e}")
+                    print(f"[ERROR] Error processing heartbeat: {e}", flush=True)
                     self.send_response(400)
                     self.end_headers()
                     return
@@ -1915,7 +1941,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 
         except Exception as e:
-            print(f"❌ Error processing request: {e}")
+            print(f"[ERROR] Error processing request: {e}", flush=True)
             self.send_response(500)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
@@ -1934,19 +1960,19 @@ def run_server(port=None):
     server_address = ('0.0.0.0', port)  # Bind to 0.0.0.0 for external access
     httpd = ThreadingHTTPServer(server_address, SimplifiedHandler)
     
-    print(f"\n{'='*70}")
-    print(f"🚌 Python Backend - ESP32 Processing Engine (MULTI-BUS ENABLED)")
-    print(f"{'='*70}")
-    print(f"📍 Default Bus: {bus_tracker.default_bus_id} ({bus_tracker.route_name})")
-    print(f"🔄 Multi-bus support: Accepts bus_id from ESP32 requests")
-    print(f"🌐 Server running on port {port}")
-    print(f"Press Ctrl+C to stop the server")
-    print(f"{'='*70}\n")
+    print(f"\n{'='*70}", flush=True)
+    print(f"[BUS] Python Backend - ESP32 Processing Engine (MULTI-BUS ENABLED)", flush=True)
+    print(f"{'='*70}", flush=True)
+    print(f"[LOC] Default Bus: {bus_tracker.default_bus_id} ({bus_tracker.route_name})", flush=True)
+    print(f"[SYNC] Multi-bus support: Accepts bus_id from ESP32 requests", flush=True)
+    print(f" Server running on port {port}", flush=True)
+    print(f"Press Ctrl+C to stop the server", flush=True)
+    print(f"{'='*70}\n", flush=True)
     
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print(f"\n🛑 Server stopped")
+        print(f"\n[STOP] Server stopped", flush=True)
         httpd.server_close()
 
 if __name__ == '__main__':

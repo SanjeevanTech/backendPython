@@ -45,10 +45,10 @@ class DynamicScheduleManager:
             # Create indexes
             self.bus_schedules.create_index([("bus_id", 1), ("active", 1)])
             
-            print("✅ Dynamic Schedule Manager initialized")
+            print("[OK] Dynamic Schedule Manager initialized", flush=True)
             
         except Exception as e:
-            print(f"❌ Database connection failed: {e}")
+            print(f"[ERROR] Database connection failed: {e}", flush=True)
             raise
     
     def create_default_schedule(self):
@@ -99,7 +99,7 @@ class DynamicScheduleManager:
         )
         # Fetch the inserted/updated document
         saved_schedule = self.bus_schedules.find_one({"bus_id": self.bus_id})
-        print(f"✅ Created/Updated default schedule: {saved_schedule.get('_id')}")
+        print(f"[OK] Created/Updated default schedule: {saved_schedule.get('_id')}", flush=True)
         return saved_schedule
     
     def load_schedule(self):
@@ -112,11 +112,11 @@ class DynamicScheduleManager:
             })
             
             if not schedule_doc:
-                print("⚠️ No active schedule found, creating default...")
+                print("[WARN] No active schedule found, creating default...", flush=True)
                 schedule_doc = self.create_default_schedule()
             
             self.current_schedule = schedule_doc
-            print(f"✅ Loaded schedule: {schedule_doc.get('schedule_name', 'Unnamed Schedule')}")
+            print(f"[OK] Loaded schedule: {schedule_doc.get('schedule_name', 'Unnamed Schedule')}", flush=True)
             
             # Display current schedule
             self.display_current_schedule()
@@ -124,29 +124,29 @@ class DynamicScheduleManager:
             return schedule_doc
             
         except Exception as e:
-            print(f"❌ Error loading schedule: {e}")
+            print(f"[ERROR] Error loading schedule: {e}", flush=True)
             return None
     
     def display_current_schedule(self):
         """Display current schedule in readable format"""
         if not self.current_schedule:
-            print("❌ No schedule loaded")
+            print("[ERROR] No schedule loaded", flush=True)
             return
         
-        print(f"\n📅 Current Schedule: {self.current_schedule.get('schedule_name', 'Unnamed Schedule')}")
-        print(f"🚌 Bus: {self.current_schedule['bus_id']} - {self.current_schedule.get('route_name', 'Unknown Route')}")
-        print(f"🌍 Timezone: {self.current_schedule.get('timezone', 'Asia/Colombo')}")
-        print(f"⚡ Auto Power Management: {self.current_schedule.get('auto_power_management', False)}")
+        print(f"\n Current Schedule: {self.current_schedule.get('schedule_name', 'Unnamed Schedule')}", flush=True)
+        print(f"[BUS] Bus: {self.current_schedule['bus_id']} - {self.current_schedule.get('route_name', 'Unknown Route')}", flush=True)
+        print(f" Timezone: {self.current_schedule.get('timezone', 'Asia/Colombo')}", flush=True)
+        print(f" Auto Power Management: {self.current_schedule.get('auto_power_management', False)}", flush=True)
         
         for i, trip in enumerate(self.current_schedule.get('trips', []), 1):
             if trip.get('active', True):
-                print(f"\n🚌 Trip {i}: {trip.get('trip_name', 'Unnamed Trip')}")
-                print(f"   📍 Direction: {trip.get('direction', 'Unknown')}")
-                print(f"   🚪 Boarding: {trip.get('boarding_start_time', 'N/A')}")
-                print(f"   🚀 Departure: {trip.get('departure_time', 'N/A')}")
-                print(f"   🏁 Arrival: {trip.get('estimated_arrival_time', 'N/A')}")
-                print(f"   ⏱️ Stop Duration: {trip.get('stop_duration_minutes', 5)} minutes")
-                print(f"   📆 Days: {', '.join(trip.get('days_of_week', ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']))}")
+                print(f"\n[BUS] Trip {i}: {trip.get('trip_name', 'Unnamed Trip')}", flush=True)
+                print(f"   [LOC] Direction: {trip.get('direction', 'Unknown')}", flush=True)
+                print(f"   [DOOR] Boarding: {trip.get('boarding_start_time', 'N/A')}", flush=True)
+                print(f"   [SPEED] Departure: {trip.get('departure_time', 'N/A')}", flush=True)
+                print(f"    Arrival: {trip.get('estimated_arrival_time', 'N/A')}", flush=True)
+                print(f"   [TIME] Stop Duration: {trip.get('stop_duration_minutes', 5)} minutes", flush=True)
+                print(f"    Days: {', '.join(trip.get('days_of_week', ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']))}", flush=True)
     
     def update_schedule(self, schedule_data, updated_by="admin"):
         """Update schedule configuration"""
@@ -168,26 +168,26 @@ class DynamicScheduleManager:
                 # Restart scheduler with new times
                 self.restart_scheduler()
                 
-                print(f"✅ Schedule updated successfully by {updated_by}")
+                print(f"[OK] Schedule updated successfully by {updated_by}", flush=True)
                 return True
             else:
-                print("❌ Failed to update schedule")
+                print("[ERROR] Failed to update schedule", flush=True)
                 return False
                 
         except Exception as e:
-            print(f"❌ Error updating schedule: {e}")
+            print(f"[ERROR] Error updating schedule: {e}", flush=True)
             return False
     
     def setup_dynamic_scheduler(self):
         """Setup scheduler based on current schedule configuration"""
         if not self.current_schedule:
-            print("❌ No schedule loaded, cannot setup scheduler")
+            print("[ERROR] No schedule loaded, cannot setup scheduler", flush=True)
             return
         
         # Clear existing scheduled jobs
         schedule.clear()
         
-        print("🔄 Setting up dynamic scheduler...")
+        print("[SYNC] Setting up dynamic scheduler...", flush=True)
         
         for trip in self.current_schedule.get('trips', []):
             if not trip.get('active', True):
@@ -199,7 +199,7 @@ class DynamicScheduleManager:
             
             # Skip if no boarding time
             if not boarding_time:
-                print(f"⚠️ Skipping trip '{trip_name}' - no boarding time")
+                print(f"[WARN] Skipping trip '{trip_name}' - no boarding time", flush=True)
                 continue
             
             # Calculate trip end time (arrival + stop duration)
@@ -220,9 +220,9 @@ class DynamicScheduleManager:
                     self.end_trip, direction, trip_name
                 )
                 
-                print(f"   📅 {day.capitalize()}: {boarding_time} → {end_time} ({trip_name})")
+                print(f"    {day.capitalize()}: {boarding_time}  {end_time} ({trip_name})", flush=True)
         
-        print("✅ Dynamic scheduler configured")
+        print("[OK] Dynamic scheduler configured", flush=True)
     
     def calculate_end_time(self, arrival_time, stop_minutes):
         """Calculate trip end time"""
@@ -253,13 +253,13 @@ class DynamicScheduleManager:
             
             self.active_trips.insert_one(trip_data)
             
-            print(f"\n🚀 AUTO-STARTED: {trip_name}")
-            print(f"   Trip ID: {trip_id}")
-            print(f"   Direction: {direction}")
-            print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"\n[SPEED] AUTO-STARTED: {trip_name}", flush=True)
+            print(f"   Trip ID: {trip_id}", flush=True)
+            print(f"   Direction: {direction}", flush=True)
+            print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
             
         except Exception as e:
-            print(f"❌ Error starting trip: {e}")
+            print(f"[ERROR] Error starting trip: {e}", flush=True)
     
     def end_trip(self, direction, trip_name):
         """End trip automatically"""
@@ -284,16 +284,16 @@ class DynamicScheduleManager:
                     }
                 )
                 
-                print(f"\n🏁 AUTO-ENDED: {trip_name}")
-                print(f"   Trip ID: {active_trip['trip_id']}")
-                print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"\n AUTO-ENDED: {trip_name}", flush=True)
+                print(f"   Trip ID: {active_trip['trip_id']}", flush=True)
+                print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
             
         except Exception as e:
-            print(f"❌ Error ending trip: {e}")
+            print(f"[ERROR] Error ending trip: {e}", flush=True)
     
     def restart_scheduler(self):
         """Restart scheduler with new configuration"""
-        print("🔄 Restarting scheduler with new configuration...")
+        print("[SYNC] Restarting scheduler with new configuration...", flush=True)
         self.setup_dynamic_scheduler()
     
     def get_current_schedule_json(self):
@@ -323,6 +323,7 @@ class DynamicScheduleManager:
             
         trip_windows = []
         today_name = datetime.now().strftime('%A').lower()
+        print(f"   [SYNC] Checking windows for today: {today_name}", flush=True)
         
         for trip in schedule_doc.get('trips', []):
             if not trip.get('active', True):
@@ -354,7 +355,7 @@ class DynamicScheduleManager:
                     "active": True
                 })
             except Exception as e:
-                print(f"❌ Error parsing trip for power window: {e}")
+                print(f"[ERROR] Error parsing trip for power window: {e}", flush=True)
                 continue
                 
         return trip_windows
@@ -362,7 +363,7 @@ class DynamicScheduleManager:
     def run_scheduler(self):
         """Run the scheduler continuously"""
         self.scheduler_running = True
-        print("🔄 Dynamic scheduler started...")
+        print("[SYNC] Dynamic scheduler started...", flush=True)
         
         while self.scheduler_running:
             schedule.run_pending()
@@ -371,20 +372,20 @@ class DynamicScheduleManager:
     def start_scheduler_thread(self):
         """Start scheduler in background thread"""
         if self.scheduler_thread and self.scheduler_thread.is_alive():
-            print("⚠️ Scheduler already running")
+            print("[WARN] Scheduler already running", flush=True)
             return
         
         self.setup_dynamic_scheduler()
         self.scheduler_thread = threading.Thread(target=self.run_scheduler, daemon=True)
         self.scheduler_thread.start()
-        print("✅ Scheduler thread started")
+        print("[OK] Scheduler thread started", flush=True)
     
     def stop_scheduler(self):
         """Stop the scheduler"""
         self.scheduler_running = False
         if self.scheduler_thread:
             self.scheduler_thread.join(timeout=5)
-        print("🛑 Scheduler stopped")
+        print("[STOP] Scheduler stopped", flush=True)
 
 # Example usage and API integration
 def create_schedule_api_endpoints():
@@ -424,10 +425,10 @@ if __name__ == "__main__":
     schedule_manager = DynamicScheduleManager()
     schedule_manager.start_scheduler_thread()
     
-    print("\n🎛️ Dynamic Schedule Manager Commands:")
-    print("  status  - Show current schedule")
-    print("  reload  - Reload schedule from database")
-    print("  quit    - Exit")
+    print("\n Dynamic Schedule Manager Commands:", flush=True)
+    print("  status  - Show current schedule", flush=True)
+    print("  reload  - Reload schedule from database", flush=True)
+    print("  quit    - Exit", flush=True)
     
     while True:
         try:
@@ -442,13 +443,13 @@ if __name__ == "__main__":
             
             elif command == "quit":
                 schedule_manager.stop_scheduler()
-                print("👋 Goodbye!")
+                print(" Goodbye!", flush=True)
                 break
             
             else:
-                print("Unknown command")
+                print("Unknown command", flush=True)
                 
         except KeyboardInterrupt:
             schedule_manager.stop_scheduler()
-            print("\n👋 Goodbye!")
+            print("\n Goodbye!", flush=True)
             break

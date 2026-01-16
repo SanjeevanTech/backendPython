@@ -19,9 +19,9 @@ class RouteDetector:
         try:
             routes = list(self.routes_collection.find({"is_active": True}))
             self.route_cache = {route['route_id']: route for route in routes}
-            print(f"✅ Loaded {len(self.route_cache)} active routes")
+            print(f"[OK] Loaded {len(self.route_cache)} active routes", flush=True)
         except Exception as e:
-            print(f"❌ Error loading routes: {e}")
+            print(f"[ERROR] Error loading routes: {e}", flush=True)
             self.route_cache = {}
     
     def calculate_distance(self, lat1, lon1, lat2, lon2):
@@ -39,7 +39,7 @@ class RouteDetector:
             
             return R * c
         except Exception as e:
-            print(f"❌ Error calculating distance: {e}")
+            print(f"[ERROR] Error calculating distance: {e}", flush=True)
             return float('inf')
     
     def is_point_near_route(self, lat, lon, route, threshold_km=2.0):
@@ -86,7 +86,7 @@ class RouteDetector:
             }
             
         except Exception as e:
-            print(f"❌ Error checking point near route: {e}")
+            print(f"[ERROR] Error checking point near route: {e}", flush=True)
             return False, None
     
     def detect_route_from_gps(self, lat, lon, threshold_km=2.0):
@@ -127,7 +127,7 @@ class RouteDetector:
             return matching_routes
             
         except Exception as e:
-            print(f"❌ Error detecting route: {e}")
+            print(f"[ERROR] Error detecting route: {e}", flush=True)
             return []
     
     def get_best_route(self, lat, lon, threshold_km=2.0):
@@ -141,10 +141,10 @@ class RouteDetector:
         
         if matching_routes:
             best_route = matching_routes[0]
-            print(f"🗺️ Detected route: {best_route['route_name']} (confidence: {best_route['confidence']})")
+            print(f"[MAP] Detected route: {best_route['route_name']} (confidence: {best_route['confidence']})", flush=True)
             return best_route
         else:
-            print(f"⚠️ No route found near GPS: {lat}, {lon}")
+            print(f"[WARN] No route found near GPS: {lat}, {lon}", flush=True)
             return None
     
     def is_journey_on_route(self, entry_lat, entry_lon, exit_lat, exit_lon, route_id, threshold_km=2.0):
@@ -178,7 +178,7 @@ class RouteDetector:
             }
             
         except Exception as e:
-            print(f"❌ Error checking journey on route: {e}")
+            print(f"[ERROR] Error checking journey on route: {e}", flush=True)
             return False, {'error': str(e)}
     
     def find_matching_season_ticket_routes(self, entry_lat, entry_lon, exit_lat, exit_lon, member_valid_routes):
@@ -260,7 +260,7 @@ class RouteDetector:
                                     'matched_route': route_name,
                                     'route_id': route_id,
                                     'match_type': 'partial_route',
-                                    'note': f'Partial route: {from_loc} → {to_loc} is valid on {route_name}'
+                                    'note': f'Partial route: {from_loc}  {to_loc} is valid on {route_name}'
                                 }
                     else:
                         # Check against patterns
@@ -279,7 +279,7 @@ class RouteDetector:
             }
             
         except Exception as e:
-            print(f"❌ Error finding matching routes: {e}")
+            print(f"[ERROR] Error finding matching routes: {e}", flush=True)
             return False, {'error': str(e)}
     
     def _check_location_proximity(self, entry_lat, entry_lon, exit_lat, exit_lon, member_valid_routes):
@@ -288,10 +288,10 @@ class RouteDetector:
         Uses bus route stops from database to validate partial routes
         
         Example: Season ticket for Chavakachcheri-Kilinochchi
-        - Bus route: Jaffna → Chavakachcheri → Kilinochchi → Colombo
-        - Entry near Chavakachcheri ✓
-        - Exit near Kilinochchi ✓
-        - Both are on same route in correct order ✓
+        - Bus route: Jaffna  Chavakachcheri  Kilinochchi  Colombo
+        - Entry near Chavakachcheri 
+        - Exit near Kilinochchi 
+        - Both are on same route in correct order 
         - Result: Valid (FREE)
         """
         import math
@@ -313,7 +313,7 @@ class RouteDetector:
             routes_with_stops = list(self.db['busRoutes'].find({'is_active': True}))
             
             if routes_with_stops:
-                print(f"   📍 Checking against {len(routes_with_stops)} routes with stops")
+                print(f"   [LOC] Checking against {len(routes_with_stops)} routes with stops", flush=True)
                 
                 for route in routes_with_stops:
                     stops = route.get('stops', [])
@@ -366,10 +366,10 @@ class RouteDetector:
                                         'exit_stop': exit_stop.get('stop_name'),
                                         'entry_order': entry_order,
                                         'exit_order': exit_order,
-                                        'note': f'Valid partial route: {entry_stop.get("stop_name")} → {exit_stop.get("stop_name")}'
+                                        'note': f'Valid partial route: {entry_stop.get("stop_name")}  {exit_stop.get("stop_name")}'
                                     }
         except Exception as e:
-            print(f"   ⚠️ Error checking route stops: {e}")
+            print(f"   [WARN] Error checking route stops: {e}", flush=True)
             # Fall back to simple proximity check
         
         # Known location coordinates (you can expand this)
@@ -404,9 +404,9 @@ class RouteDetector:
             # Check if exit is near "to" location
             exit_distance = haversine_distance(exit_lat, exit_lon, to_coords[0], to_coords[1])
             
-            print(f"   📍 Proximity check: {from_loc} → {to_loc}")
-            print(f"      Entry distance from {from_loc}: {entry_distance:.2f} km")
-            print(f"      Exit distance from {to_loc}: {exit_distance:.2f} km")
+            print(f"   [LOC] Proximity check: {from_loc}  {to_loc}", flush=True)
+            print(f"      Entry distance from {from_loc}: {entry_distance:.2f} km", flush=True)
+            print(f"      Exit distance from {to_loc}: {exit_distance:.2f} km", flush=True)
             
             if entry_distance <= PROXIMITY_THRESHOLD_KM and exit_distance <= PROXIMITY_THRESHOLD_KM:
                 return True, {
@@ -415,7 +415,7 @@ class RouteDetector:
                     'to_location': to_loc,
                     'entry_distance_km': round(entry_distance, 2),
                     'exit_distance_km': round(exit_distance, 2),
-                    'note': f'Journey within valid route: {from_loc} → {to_loc}'
+                    'note': f'Journey within valid route: {from_loc}  {to_loc}'
                 }
         
         return False, {
@@ -426,7 +426,7 @@ class RouteDetector:
 
 # Test function
 if __name__ == '__main__':
-    print("🧪 Testing Route Detector...")
+    print(" Testing Route Detector...", flush=True)
     
     # Mock database
     class MockDB:
@@ -459,16 +459,16 @@ if __name__ == '__main__':
     detector = RouteDetector(mock_db)
     
     # Test 1: Detect route from GPS
-    print("\nTest 1: Detect route from GPS near Jaffna")
+    print("\nTest 1: Detect route from GPS near Jaffna", flush=True)
     result = detector.get_best_route(9.6615, 80.0255)
-    print(f"Result: {result}")
+    print(f"Result: {result}", flush=True)
     
     # Test 2: Check if journey is on route
-    print("\nTest 2: Check journey Jaffna → Kodikamam")
+    print("\nTest 2: Check journey Jaffna  Kodikamam", flush=True)
     is_on_route, info = detector.is_journey_on_route(
         9.6615, 80.0255,  # Jaffna
         9.7615, 80.1255,  # Kodikamam
         'ROUTE_001'
     )
-    print(f"On route: {is_on_route}")
-    print(f"Info: {info}")
+    print(f"On route: {is_on_route}", flush=True)
+    print(f"Info: {info}", flush=True)
