@@ -158,15 +158,34 @@ class SimplifiedBusTracker:
             })
             
             if active_trip:
-                self.current_trips[bus_id] = {
-                    'trip_id': active_trip['trip_id'],
-                    'bus_id': bus_id,
-                    'route_name': active_trip.get('route_name', self.route_name),
-                    'start_time': active_trip['start_time'],
-                    'status': 'active',
-                    '_id': active_trip['_id']
-                }
-                print(f"[LOC] Loaded active trip for {bus_id}: {active_trip['trip_id']}", flush=True)
+                # Check for stale trip (older than 12 hours)
+                start_time = active_trip.get('start_time')
+                if start_time and (datetime.utcnow() - start_time).total_seconds() > (12 * 3600):
+                    print(f"[WARN] Found stale active trip {active_trip['trip_id']} (Started: {start_time}). Closing it.", flush=True)
+                    
+                    # Close the stale trip
+                    self.trip_sessions.update_one(
+                        {"_id": active_trip['_id']},
+                        {
+                            "$set": {
+                                "status": "completed_auto_cleanup",
+                                "end_time": datetime.utcnow(),
+                                "note": "Auto-closed by server restart (stale)"
+                            }
+                        }
+                    )
+                    # Start fresh trip
+                    self.start_new_trip(bus_id=bus_id)
+                else:
+                    self.current_trips[bus_id] = {
+                        'trip_id': active_trip['trip_id'],
+                        'bus_id': bus_id,
+                        'route_name': active_trip.get('route_name', self.route_name),
+                        'start_time': active_trip['start_time'],
+                        'status': 'active',
+                        '_id': active_trip['_id']
+                    }
+                    print(f"[LOC] Loaded active trip for {bus_id}: {active_trip['trip_id']}", flush=True)
             else:
                 # Auto-start new trip for this bus
                 self.start_new_trip(bus_id=bus_id)
