@@ -46,8 +46,8 @@ class SimplifiedBusTracker:
         # Configuration - MULTI-BUS SUPPORT
         self.default_bus_id = "BUS_JC_001"  # Default bus if none specified
         self.route_name = "Jaffna-Colombo"  # Will be updated automatically
-        self.similarity_threshold = 0.7
-        self.season_ticket_similarity_threshold = 0.65  # Lower threshold for ESP32 face variations
+        self.similarity_threshold = 0.62
+        self.season_ticket_similarity_threshold = 0.62  # Lower threshold for ESP32 face variations
         self.time_window_hours = 48  # Increased to 48 hours for testing
         self.timezone_offset_hours = 5.5  # Adjust for Sri Lanka (+5:30)
         self.debug_allow_all_logs = True  # SET TO TRUE FOR TESTING (Accepts logs outside schedule)
@@ -100,7 +100,7 @@ class SimplifiedBusTracker:
                 self.route_detector = None
             
             # Initialize contractor similarity threshold
-            self.contractor_similarity_threshold = 0.65  # Matched with season ticket threshold for consistency
+            self.contractor_similarity_threshold = 0.62  # Matched with other thresholds for consistency
             
             # Don't auto-load trip on startup - trips are created on-demand per bus
             
@@ -954,6 +954,12 @@ class SimplifiedBusTracker:
                 }
                 print(f"[TICKET] Season ticket member detected at ENTRY on {bus_id}: {season_member['name']}", flush=True)
             
+            # Get location name
+            location_name = self.reverse_geocode(
+                log_entry.get('latitude', 0),
+                log_entry.get('longitude', 0)
+            )
+            
             temp_entry = {
                 "trip_id": current_trip['trip_id'],
                 "trip_start_time": current_trip['start_time'],
@@ -967,7 +973,8 @@ class SimplifiedBusTracker:
                     "latitude": log_entry.get('latitude', 0),
                     "longitude": log_entry.get('longitude', 0),
                     "device_id": log_entry.get('device_id'),
-                    "timestamp": log_entry.get('timestamp')
+                    "timestamp": log_entry.get('timestamp'),
+                    "location_name": location_name
                 },
                 "entry_timestamp": self._parse_timestamp_safe(log_entry.get('timestamp')),
                 "created_at": datetime.utcnow()
@@ -1034,6 +1041,7 @@ class SimplifiedBusTracker:
             
             best_match = None
             best_similarity = 0.0
+            actual_best_similarity = 0.0 # Track actual best even if below threshold
             
             for entry in entries_list:
                 if not entry.get('face_embedding'):
@@ -1045,13 +1053,16 @@ class SimplifiedBusTracker:
                 # Calculate cosine similarity
                 similarity = cosine_similarity(exit_array, entry_array)[0][0]
                 
+                if similarity > actual_best_similarity:
+                    actual_best_similarity = similarity
+
                 print(f"  Entry {entry['_id']}: similarity = {similarity:.3f} (threshold: {self.similarity_threshold})", flush=True)
                 
                 if similarity > best_similarity and similarity > self.similarity_threshold:
                     best_similarity = similarity
                     best_match = entry
             
-            print(f" Best match: similarity = {best_similarity:.3f}", flush=True)
+            print(f" Best match: similarity = {actual_best_similarity:.3f} (Passed threshold: {'YES' if best_match else 'NO'})", flush=True)
             
             if best_match:
                 # Create final passenger record
@@ -1301,6 +1312,12 @@ class SimplifiedBusTracker:
                 trip_id = f"FALLBACK_{bus_id}_{datetime.now().strftime('%Y%m%d_%H%M')}"
                 trip_start_time = datetime.utcnow()
             
+            # Get location name
+            location_name = self.reverse_geocode(
+                exit_log.get('latitude', 0),
+                exit_log.get('longitude', 0)
+            )
+            
             unmatched_exit = {
                 "trip_id": trip_id,
                 "trip_start_time": trip_start_time,
@@ -1314,7 +1331,8 @@ class SimplifiedBusTracker:
                     "latitude": exit_log.get('latitude', 0),
                     "longitude": exit_log.get('longitude', 0),
                     "device_id": exit_log.get('device_id'),
-                    "timestamp": exit_log.get('timestamp')
+                    "timestamp": exit_log.get('timestamp'),
+                    "location_name": location_name
                 },
                 "timestamp": self._parse_timestamp_safe(exit_log.get('timestamp')),
                 "best_similarity_found": float(best_similarity),
