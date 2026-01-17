@@ -46,8 +46,8 @@ class SimplifiedBusTracker:
         # Configuration - MULTI-BUS SUPPORT
         self.default_bus_id = "BUS_JC_001"  # Default bus if none specified
         self.route_name = "Jaffna-Colombo"  # Will be updated automatically
-        self.similarity_threshold = 0.62
-        self.season_ticket_similarity_threshold = 0.62  # Lower threshold for ESP32 face variations
+        self.similarity_threshold = 0.60
+        self.season_ticket_similarity_threshold = 0.60  # Lower threshold for ESP32 face variations
         self.time_window_hours = 48  # Increased to 48 hours for testing
         self.timezone_offset_hours = 5.5  # Adjust for Sri Lanka (+5:30)
         self.debug_allow_all_logs = True  # SET TO TRUE FOR TESTING (Accepts logs outside schedule)
@@ -100,7 +100,7 @@ class SimplifiedBusTracker:
                 self.route_detector = None
             
             # Initialize contractor similarity threshold
-            self.contractor_similarity_threshold = 0.62  # Matched with other thresholds for consistency
+            self.contractor_similarity_threshold = 0.60  # Matched with other thresholds for consistency
             
             # Don't auto-load trip on startup - trips are created on-demand per bus
             
@@ -1201,7 +1201,7 @@ class SimplifiedBusTracker:
                 
                 return final_passenger, best_similarity
             
-            return None, best_similarity
+            return None, actual_best_similarity
             
         except Exception as e:
             print(f"[ERROR] Error finding matching entry: {e}", flush=True)
