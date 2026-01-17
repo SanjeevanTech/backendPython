@@ -163,6 +163,43 @@ class SimplifiedBusTracker:
                 if start_time and (datetime.utcnow() - start_time).total_seconds() > (12 * 3600):
                     print(f"[WARN] Found stale active trip {active_trip['trip_id']} (Started: {start_time}). Closing it.", flush=True)
                     
+                    # --- PROCESS STALE ENTRIES BEFORE CLOSING ---
+                    trip_id = active_trip['trip_id']
+                    
+                    # Count passengers
+                    passenger_count = self.final_passengers.count_documents({"trip_id": trip_id})
+                    
+                    # Move remaining temp_entries to unmatched
+                    remaining = list(self.temp_entries.find({
+                        "trip_id": trip_id,
+                        "bus_id": bus_id
+                    }))
+                    
+                    print(f"[CLEANUP] Processing {len(remaining)} stale temp_entries for {trip_id}", flush=True)
+                    
+                    unmatched_count = 0
+                    for entry in remaining:
+                        unmatched_entry = {
+                            "trip_id": trip_id,
+                            "bus_id": bus_id,
+                            "route_name": entry.get('route_name', self.route_name),
+                            "type": "ENTRY",
+                            "trip_start_time": start_time,
+                            "face_id": entry.get('face_id', 0),
+                            "face_embedding": entry.get('face_embedding', []),
+                            "embedding_size": entry.get('embedding_size', 0),
+                            "location": entry.get('entry_location', {}),
+                            "timestamp": entry.get('entry_timestamp'),
+                            "best_similarity_found": 0.0,
+                            "reason": "Auto-closed stale trip",
+                            "created_at": datetime.now()
+                        }
+                        self.unmatched_passengers.insert_one(unmatched_entry)
+                        unmatched_count += 1
+                        
+                    # Delete temp entries
+                    self.temp_entries.delete_many({"trip_id": trip_id})
+                    
                     # Close the stale trip
                     self.trip_sessions.update_one(
                         {"_id": active_trip['_id']},
@@ -170,6 +207,8 @@ class SimplifiedBusTracker:
                             "$set": {
                                 "status": "completed_auto_cleanup",
                                 "end_time": datetime.utcnow(),
+                                "total_passengers": passenger_count,
+                                "total_unmatched": unmatched_count,
                                 "note": "Auto-closed by server restart (stale)"
                             }
                         }

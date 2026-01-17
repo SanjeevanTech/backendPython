@@ -10,7 +10,7 @@ from datetime import datetime
 class RouteDetector:
     def __init__(self, db):
         self.db = db
-        self.routes_collection = db['routes']
+        self.routes_collection = db['busRoutes']
         self.route_cache = {}
         self.load_routes()
     
@@ -18,7 +18,26 @@ class RouteDetector:
         """Load all routes from database"""
         try:
             routes = list(self.routes_collection.find({"is_active": True}))
-            self.route_cache = {route['route_id']: route for route in routes}
+            
+            processed_routes = []
+            for route in routes:
+                # If route uses waypoint groups, we need to gather stops from them
+                if route.get('waypoint_groups'):
+                    all_stops = []
+                    # Sort groups by order if possible
+                    groups = sorted(route['waypoint_groups'], key=lambda x: x.get('order', 0))
+                    
+                    for group_ref in groups:
+                        group_id = group_ref.get('group_id')
+                        group_data = self.db['waypointGroups'].find_one({"group_id": group_id})
+                        if group_data and group_data.get('waypoints'):
+                            all_stops.extend(group_data['waypoints'])
+                    
+                    route['stops'] = all_stops
+                
+                processed_routes.append(route)
+
+            self.route_cache = {route['route_id']: route for route in processed_routes}
             print(f"[OK] Loaded {len(self.route_cache)} active routes", flush=True)
         except Exception as e:
             print(f"[ERROR] Error loading routes: {e}", flush=True)
@@ -56,7 +75,7 @@ class RouteDetector:
             dict: Nearest waypoint info
         """
         try:
-            waypoints = route.get('waypoints', [])
+            waypoints = route.get('stops', [])
             
             if not waypoints:
                 return False, None
