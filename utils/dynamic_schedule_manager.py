@@ -5,9 +5,8 @@ Admin can configure bus schedules through web interface
 No hard-coded times - fully configurable
 """
 
-import json
 import threading
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta
 from pymongo import MongoClient
 import schedule
 
@@ -19,7 +18,6 @@ class DynamicScheduleManager:
         
         # Collections
         self.bus_schedules = None
-        self.active_trips = None
         
         # Current schedule (loaded from database)
         self.current_schedule = None
@@ -55,56 +53,6 @@ class DynamicScheduleManager:
             print(f"[ERROR] Database connection failed: {e}", flush=True)
             raise
     
-    def create_default_schedule(self):
-        """Create default schedule if none exists"""
-        default_schedule = {
-            "bus_id": self.bus_id,
-            "route_name": "Jaffna-Colombo",
-            "schedule_name": "Default Daily Schedule",
-            "active": True,
-            "trips": [
-                {
-                    "trip_name": "Morning - Jaffna to Colombo",
-                    "route": "Jaffna-Colombo",
-                    "direction": "jaffna_to_colombo",
-                    "boarding_start_time": "06:00",
-                    "departure_time": "07:00",
-                    "estimated_arrival_time": "17:00",
-                    "stop_duration_minutes": 30,
-                    "days_of_week": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"],
-                    "active": True
-                },
-                {
-                    "trip_name": "Evening - Colombo to Jaffna",
-                    "route": "Colombo-Jaffna",
-                    "direction": "colombo_to_jaffna",
-                    "boarding_start_time": "17:30",
-                    "departure_time": "18:00",
-                    "estimated_arrival_time": "03:00",  # Next day
-                    "stop_duration_minutes": 30,
-                    "days_of_week": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"],
-                    "active": True
-                }
-            ],
-            "timezone": "Asia/Colombo",
-            "auto_power_management": True,
-            "power_off_delay_minutes": 30,  # Power off 30 minutes after trip end
-            "created_at": datetime.now(),
-            "updated_at": datetime.now(),
-            "created_by": "system"
-        }
-        
-        # Insert or update default schedule
-        # Use update_one with upsert=True to avoid duplicate key errors if it already exists but was not found by filter
-        self.bus_schedules.update_one(
-            {"bus_id": self.bus_id},
-            {"$set": default_schedule},
-            upsert=True
-        )
-        # Fetch the inserted/updated document
-        saved_schedule = self.bus_schedules.find_one({"bus_id": self.bus_id})
-        print(f"[OK] Created/Updated default schedule: {saved_schedule.get('_id')}", flush=True)
-        return saved_schedule
     
     def load_schedule(self):
         """Load active schedule from database"""
@@ -116,11 +64,12 @@ class DynamicScheduleManager:
             })
             
             if not schedule_doc:
-                print("[WARN] No active schedule found, creating default...", flush=True)
-                schedule_doc = self.create_default_schedule()
+                print(f"[WARN] No active schedule found in MongoDB for {self.bus_id}. Waiting for Admin to create one.", flush=True)
+                self.current_schedule = None
+                return None
             
             self.current_schedule = schedule_doc
-            print(f"[OK] Loaded schedule: {schedule_doc.get('schedule_name', 'Unnamed Schedule')}", flush=True)
+            print(f"[OK] Loaded Admin Schedule: {schedule_doc.get('schedule_name', 'Unnamed Schedule')}", flush=True)
             
             # Display current schedule
             self.display_current_schedule()
@@ -211,26 +160,17 @@ class DynamicScheduleManager:
             stop_minutes = trip.get('stop_duration_minutes', 5)  # Default 5 minutes if not specified
             end_time = self.calculate_end_time(arrival_time, stop_minutes)
             
-            # Schedule for each day of the week
-            days_of_week = trip.get('days_of_week', ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'])
-            for day_name in days_of_week:
-                # Schedule trip start
-                getattr(schedule.every(), day_name).at(boarding_time).do(
-                    self.start_trip, direction, trip_name
-                )
-                
-                # Handle overnight trips: If end_time is earlier than boarding_time, it ends the next day
-                end_day_name = day_name
-                if end_time < boarding_time:
-                    end_day_name = self.get_next_day_name(day_name)
-                    print(f"    [OVERNIGHT] Trip ends next day: {end_day_name} at {end_time}", flush=True)
-                
-                # Schedule trip end
-                getattr(schedule.every(), end_day_name).at(end_time).do(
-                    self.end_trip, direction, trip_name
-                )
-                
-                print(f"    {day_name.capitalize()}: Start {boarding_time} -> End {end_day_name.capitalize()} {end_time} ({trip_name})", flush=True)
+            # Schedule trip to start EVERY DAY at the boarding time
+            schedule.every().day.at(boarding_time).do(
+                self.start_trip, direction, trip_name
+            )
+            
+            # Schedule trip to end EVERY DAY at the calculated end time
+            schedule.every().day.at(end_time).do(
+                self.end_trip, direction, trip_name
+            )
+            
+            print(f"    Scheduled Daily: Start {boarding_time} -> End {end_time} ({trip_name})", flush=True)
         
         print("[OK] Dynamic scheduler configured", flush=True)
     
@@ -243,15 +183,7 @@ class DynamicScheduleManager:
         except:
             return "18:00"  # Default fallback
 
-    def get_next_day_name(self, day_name):
-        """Get the name of the next day of the week"""
-        days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-        try:
-            idx = days.index(day_name.lower())
-            return days[(idx + 1) % 7]
-        except ValueError:
-            return day_name
-    
+
     def start_trip(self, direction, trip_name):
         """Start trip automatically"""
         try:
@@ -364,8 +296,6 @@ class DynamicScheduleManager:
             if not trip.get('active', True):
                 continue
                 
-            days = [d.lower() for d in trip.get('days_of_week', [])]
-            
             # Calculate times
             try:
                 start_time_str = trip.get('boarding_start_time', '06:00')
@@ -379,16 +309,14 @@ class DynamicScheduleManager:
                 
                 is_overnight = end_time_str < start_time_str
                 
-                # Add if trip starts today OR if it started yesterday and is overnight
-                if today_name in days or (yesterday_name in days and is_overnight):
-                    trip_windows.append({
-                        "start_time": start_time_str,
-                        "end_time": end_time_str,
-                        "route": trip.get('route', trip.get('trip_name', 'Trip')),
-                        "active": True,
-                        "is_overnight": is_overnight,
-                        "started_yesterday": yesterday_name in days and today_name not in days
-                    })
+                # Always add to windows - we ignore the day of the week
+                trip_windows.append({
+                    "start_time": start_time_str,
+                    "end_time": end_time_str,
+                    "route": trip.get('route', trip.get('trip_name', 'Trip')),
+                    "active": True,
+                    "is_overnight": is_overnight
+                })
             except Exception as e:
                 print(f"[ERROR] Error parsing trip window: {e}", flush=True)
                 continue
@@ -422,69 +350,4 @@ class DynamicScheduleManager:
             self.scheduler_thread.join(timeout=5)
         print("[STOP] Scheduler stopped", flush=True)
 
-# Example usage and API integration
-def create_schedule_api_endpoints():
-    """Example API endpoints for schedule management"""
-    
-    schedule_manager = DynamicScheduleManager()
-    
-    def get_schedule():
-        """GET /api/schedule - Get current schedule"""
-        return schedule_manager.get_current_schedule_json()
-    
-    def update_schedule(new_schedule_data, admin_user="admin"):
-        """POST /api/schedule - Update schedule"""
-        success = schedule_manager.update_schedule(new_schedule_data, admin_user)
-        if success:
-            return {"status": "success", "message": "Schedule updated successfully"}
-        else:
-            return {"status": "error", "message": "Failed to update schedule"}
-    
-    def get_schedule_status():
-        """GET /api/schedule/status - Get scheduler status"""
-        return {
-            "scheduler_running": schedule_manager.scheduler_running,
-            "current_schedule_name": schedule_manager.current_schedule.get('schedule_name') if schedule_manager.current_schedule else None,
-            "bus_id": schedule_manager.bus_id,
-            "last_updated": schedule_manager.current_schedule.get('updated_at') if schedule_manager.current_schedule else None
-        }
-    
-    return schedule_manager, {
-        "get_schedule": get_schedule,
-        "update_schedule": update_schedule,
-        "get_status": get_schedule_status
-    }
-
-if __name__ == "__main__":
-    # Test the dynamic schedule manager
-    schedule_manager = DynamicScheduleManager()
-    schedule_manager.start_scheduler_thread()
-    
-    print("\n Dynamic Schedule Manager Commands:", flush=True)
-    print("  status  - Show current schedule", flush=True)
-    print("  reload  - Reload schedule from database", flush=True)
-    print("  quit    - Exit", flush=True)
-    
-    while True:
-        try:
-            command = input("\n> ").strip().lower()
-            
-            if command == "status":
-                schedule_manager.display_current_schedule()
-            
-            elif command == "reload":
-                schedule_manager.load_schedule()
-                schedule_manager.restart_scheduler()
-            
-            elif command == "quit":
-                schedule_manager.stop_scheduler()
-                print(" Goodbye!", flush=True)
-                break
-            
-            else:
-                print("Unknown command", flush=True)
-                
-        except KeyboardInterrupt:
-            schedule_manager.stop_scheduler()
-            print("\n Goodbye!", flush=True)
-            break
+        print("[STOP] Scheduler stopped", flush=True)

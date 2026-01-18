@@ -102,24 +102,14 @@ class SimplifiedBusTracker:
             # Initialize contractor similarity threshold
             self.contractor_similarity_threshold = 0.60  # Matched with other thresholds for consistency
             
-            # Load ALL active trips from database into memory to ensure background monitor works immediately
+            # Load active trips from database
             try:
                 active_sessions = self.trip_sessions.find({"status": "active"})
-                count = 0
                 for session in active_sessions:
                     bus_id = session.get('bus_id')
                     if bus_id:
-                        self.current_trips[bus_id] = {
-                            'trip_id': session['trip_id'],
-                            'bus_id': bus_id,
-                            'route_name': session.get('route_name', self.route_name),
-                            'start_time': session['start_time'],
-                            'status': 'active',
-                            '_id': session['_id']
-                        }
-                        count += 1
-                if count > 0:
-                    print(f"[OK] Loaded {count} active trips from database", flush=True)
+                        self.load_current_trip(bus_id)
+                print("[OK] Active trips loaded from database", flush=True)
             except Exception as e:
                 print(f"[WARN] Failed to load active trips: {e}", flush=True)
             
@@ -472,25 +462,6 @@ class SimplifiedBusTracker:
         count = self.final_passengers.count_documents({}) + 1
         return f"PASS_{count:06d}"
     
-    def calculate_haversine_distance(self, lat1, lon1, lat2, lon2):
-        """Calculate straight-line distance between two points using Haversine formula"""
-        try:
-            # Convert latitude and longitude from degrees to radians
-            lat1, lon1, lat2, lon2 = map(math.radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
-            
-            # Haversine formula
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-            c = 2 * math.asin(math.sqrt(a))
-            
-            # Radius of earth in kilometers
-            r = 6371
-            
-            return c * r
-        except Exception as e:
-            print(f"[ERROR] Error calculating Haversine distance: {e}", flush=True)
-            return 0.0
     
     def calculate_road_distance_osrm(self, start_lat, start_lon, end_lat, end_lon):
         """Calculate road distance using OSRM API (free, no API key required)"""
@@ -1532,36 +1503,6 @@ def get_power_config(bus_id):
         print(f"[ERROR] Error getting power config: {e}", flush=True)
         return None
 
-def update_power_config(bus_id, config_data):
-    """Update power configuration for a bus"""
-    try:
-        update_data = {
-            "bus_id": bus_id,
-            "bus_name": config_data.get('bus_name', f"Bus {bus_id}"),
-            "deep_sleep_enabled": config_data.get('deep_sleep_enabled', True),
-            "trip_start": config_data.get('trip_start', '00:00'),
-            "trip_end": config_data.get('trip_end', '23:59'),
-            "maintenance_interval": config_data.get('maintenance_interval', 5),
-            "maintenance_duration": config_data.get('maintenance_duration', 3),
-            "last_updated": datetime.now()
-        }
-        
-        # Upsert (update or insert)
-        bus_tracker.power_configs.update_one(
-            {"bus_id": bus_id},
-            {"$set": update_data},
-            upsert=True
-        )
-        
-        print(f"[OK] Power config updated for {bus_id}", flush=True)
-        return True
-    except Exception as e:
-        print(f"[ERROR] Error updating power config: {e}", flush=True)
-        return False
-
-# Removed: update_board_heartbeat() - Not used by ESP32 hardware
-
-# Removed: delete_power_config() - Not exposed via API, unused
 
 class SimplifiedHandler(BaseHTTPRequestHandler):
     def _send_json_response(self, data, status_code=200):
@@ -1914,11 +1855,6 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                             
                             for trip in schedule_doc.get('trips', []):
                                 if not trip.get('active', True): continue
-                                
-                                # Check if log is on a scheduled day
-                                days = [d.lower() for d in trip.get('days_of_week', [])]
-                                # Default to all days if days_of_week is empty or missing
-                                if days and today_name not in days: continue
                                 
                                 # Get window: Boarding Start -> Arrival + Stop Duration
                                 start_t = trip.get('boarding_start_time', '06:00')
