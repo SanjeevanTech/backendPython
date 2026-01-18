@@ -44,7 +44,7 @@ class DynamicScheduleManager:
             
             # Collections
             self.bus_schedules = self.db['bus_schedules']
-            self.active_trips = self.db['active_trips']
+            self.trip_sessions = self.db['tripSessions']
             
             # Create indexes
             self.bus_schedules.create_index([("bus_id", 1), ("active", 1)])
@@ -264,13 +264,13 @@ class DynamicScheduleManager:
                 "bus_id": self.bus_id,
                 "direction": direction,
                 "trip_name": trip_name,
-                "status": "ACTIVE",
+                "status": "active",
                 "start_time": datetime.now(),
                 "schedule_config": self.current_schedule,
                 "created_at": datetime.now()
             }
             
-            self.active_trips.insert_one(trip_data)
+            self.trip_sessions.insert_one(trip_data)
             
             print(f"\n[SPEED] AUTO-STARTED: {trip_name}", flush=True)
             print(f"   Trip ID: {trip_id}", flush=True)
@@ -290,20 +290,19 @@ class DynamicScheduleManager:
     def end_trip(self, direction, trip_name):
         """End trip automatically"""
         try:
-            # Find active trip
-            active_trip = self.active_trips.find_one({
+            active_trip = self.trip_sessions.find_one({
                 "bus_id": self.bus_id,
-                "status": "ACTIVE",
+                "status": "active",
                 "direction": direction
             })
             
             if active_trip:
                 # Update trip status
-                self.active_trips.update_one(
+                self.trip_sessions.update_one(
                     {"_id": active_trip["_id"]},
                     {
                         "$set": {
-                            "status": "COMPLETED",
+                            "status": "completed",
                             "end_time": datetime.now(),
                             "updated_at": datetime.now()
                         }
