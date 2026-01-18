@@ -29,6 +29,10 @@ class DynamicScheduleManager:
         self.scheduler_running = False
         self.scheduler_thread = None
         
+        # Callbacks
+        self.on_trip_start = None
+        self.on_trip_end = None
+        
         self.init_database()
         self.load_schedule()
     
@@ -209,18 +213,24 @@ class DynamicScheduleManager:
             
             # Schedule for each day of the week
             days_of_week = trip.get('days_of_week', ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'])
-            for day in days_of_week:
+            for day_name in days_of_week:
                 # Schedule trip start
-                getattr(schedule.every(), day).at(boarding_time).do(
+                getattr(schedule.every(), day_name).at(boarding_time).do(
                     self.start_trip, direction, trip_name
                 )
                 
+                # Handle overnight trips: If end_time is earlier than boarding_time, it ends the next day
+                end_day_name = day_name
+                if end_time < boarding_time:
+                    end_day_name = self.get_next_day_name(day_name)
+                    print(f"    [OVERNIGHT] Trip ends next day: {end_day_name} at {end_time}", flush=True)
+                
                 # Schedule trip end
-                getattr(schedule.every(), day).at(end_time).do(
+                getattr(schedule.every(), end_day_name).at(end_time).do(
                     self.end_trip, direction, trip_name
                 )
                 
-                print(f"    {day.capitalize()}: {boarding_time}  {end_time} ({trip_name})", flush=True)
+                print(f"    {day_name.capitalize()}: Start {boarding_time} -> End {end_day_name.capitalize()} {end_time} ({trip_name})", flush=True)
         
         print("[OK] Dynamic scheduler configured", flush=True)
     
@@ -232,6 +242,15 @@ class DynamicScheduleManager:
             return end_time.strftime("%H:%M")
         except:
             return "18:00"  # Default fallback
+
+    def get_next_day_name(self, day_name):
+        """Get the name of the next day of the week"""
+        days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+        try:
+            idx = days.index(day_name.lower())
+            return days[(idx + 1) % 7]
+        except ValueError:
+            return day_name
     
     def start_trip(self, direction, trip_name):
         """Start trip automatically"""
@@ -257,6 +276,13 @@ class DynamicScheduleManager:
             print(f"   Trip ID: {trip_id}", flush=True)
             print(f"   Direction: {direction}", flush=True)
             print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+            
+            # Trigger callback
+            if self.on_trip_start:
+                try:
+                    self.on_trip_start(self.bus_id, trip_id, direction)
+                except Exception as cb_e:
+                    print(f"[ERROR] Error in on_trip_start callback: {cb_e}", flush=True)
             
         except Exception as e:
             print(f"[ERROR] Error starting trip: {e}", flush=True)
@@ -287,6 +313,13 @@ class DynamicScheduleManager:
                 print(f"\n AUTO-ENDED: {trip_name}", flush=True)
                 print(f"   Trip ID: {active_trip['trip_id']}", flush=True)
                 print(f"   Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+                
+                # Trigger callback
+                if self.on_trip_end:
+                    try:
+                        self.on_trip_end(self.bus_id)
+                    except Exception as cb_e:
+                        print(f"[ERROR] Error in on_trip_end callback: {cb_e}", flush=True)
             
         except Exception as e:
             print(f"[ERROR] Error ending trip: {e}", flush=True)
@@ -322,40 +355,43 @@ class DynamicScheduleManager:
             return []
             
         trip_windows = []
-        today_name = datetime.now().strftime('%A').lower()
-        print(f"   [SYNC] Checking windows for today: {today_name}", flush=True)
+        now = datetime.now()
+        today_name = now.strftime('%A').lower()
+        yesterday_name = (now - timedelta(days=1)).strftime('%A').lower()
+        
+        print(f"   [SYNC] Checking windows for today ({today_name}) and yesterday ({yesterday_name})", flush=True)
         
         for trip in schedule_doc.get('trips', []):
             if not trip.get('active', True):
                 continue
                 
             days = [d.lower() for d in trip.get('days_of_week', [])]
-            if today_name not in days:
-                continue
-                
+            
+            # Calculate times
             try:
-                # Get start time
-                start_time = trip.get('boarding_start_time', '06:00')
-                start_h, start_m = map(int, start_time.split(':'))
-                
-                # Calculate end time
-                arrival_time = trip.get('estimated_arrival_time', start_time)
+                start_time_str = trip.get('boarding_start_time', '06:00')
+                arrival_time_str = trip.get('estimated_arrival_time', start_time_str)
                 stop_minutes = trip.get('stop_duration_minutes', 30)
                 
-                # Use same calculation as scheduler
-                arrival_dt = datetime.strptime(arrival_time, "%H:%M")
+                # Calculate end_time_str
+                arrival_dt = datetime.strptime(arrival_time_str, "%H:%M")
                 end_dt = arrival_dt + timedelta(minutes=stop_minutes)
-                end_time = end_dt.strftime("%H:%M")
-                end_h, end_m = map(int, end_time.split(':'))
+                end_time_str = end_dt.strftime("%H:%M")
                 
-                trip_windows.append({
-                    "start_time": f"{start_h:02d}:{start_m:02d}",
-                    "end_time": f"{end_h:02d}:{end_m:02d}",
-                    "route": trip.get('route', trip.get('trip_name', 'Trip')),
-                    "active": True
-                })
+                is_overnight = end_time_str < start_time_str
+                
+                # Add if trip starts today OR if it started yesterday and is overnight
+                if today_name in days or (yesterday_name in days and is_overnight):
+                    trip_windows.append({
+                        "start_time": start_time_str,
+                        "end_time": end_time_str,
+                        "route": trip.get('route', trip.get('trip_name', 'Trip')),
+                        "active": True,
+                        "is_overnight": is_overnight,
+                        "started_yesterday": yesterday_name in days and today_name not in days
+                    })
             except Exception as e:
-                print(f"[ERROR] Error parsing trip for power window: {e}", flush=True)
+                print(f"[ERROR] Error parsing trip window: {e}", flush=True)
                 continue
                 
         return trip_windows

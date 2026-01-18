@@ -102,7 +102,26 @@ class SimplifiedBusTracker:
             # Initialize contractor similarity threshold
             self.contractor_similarity_threshold = 0.60  # Matched with other thresholds for consistency
             
-            # Don't auto-load trip on startup - trips are created on-demand per bus
+            # Load ALL active trips from database into memory to ensure background monitor works immediately
+            try:
+                active_sessions = self.trip_sessions.find({"status": "active"})
+                count = 0
+                for session in active_sessions:
+                    bus_id = session.get('bus_id')
+                    if bus_id:
+                        self.current_trips[bus_id] = {
+                            'trip_id': session['trip_id'],
+                            'bus_id': bus_id,
+                            'route_name': session.get('route_name', self.route_name),
+                            'start_time': session['start_time'],
+                            'status': 'active',
+                            '_id': session['_id']
+                        }
+                        count += 1
+                if count > 0:
+                    print(f"[OK] Loaded {count} active trips from database", flush=True)
+            except Exception as e:
+                print(f"[WARN] Failed to load active trips: {e}", flush=True)
             
         except Exception as e:
             print(f"[ERROR] Failed to connect to MongoDB: {e}", flush=True)
@@ -297,27 +316,41 @@ class SimplifiedBusTracker:
             return None
     
     def end_current_trip(self, bus_id=None):
-        """End current trip for specific bus and move unmatched to unmatched collection"""
+        """Wrapper to end the currently tracked trip for a bus"""
         if bus_id is None:
             bus_id = self.default_bus_id
+        
+        current_trip = self.current_trips.get(bus_id)
+        if not current_trip:
+            print(f"[ERROR] No active trip in memory for {bus_id}", flush=True)
+            return False
+            
+        return self.close_trip_session(bus_id, current_trip['trip_id'])
+
+    def close_trip_session(self, bus_id, trip_id):
+        """
+        TRIP-WISE CLEANUP: Close a specific trip session and move its unmatched entries.
+        This allows cleaning up old sessions even if they aren't 'current' in memory.
+        """
         try:
-            current_trip = self.current_trips.get(bus_id)
-            if not current_trip:
-                print(f"[ERROR] No active trip for {bus_id}", flush=True)
+            # Find the trip session in DB
+            session = self.trip_sessions.find_one({"trip_id": trip_id, "bus_id": bus_id})
+            if not session:
+                print(f"[ERROR] Session {trip_id} not found in database", flush=True)
                 return False
+
+            print(f"[CLEANUP] Closing Session {trip_id} for bus {bus_id}...", flush=True)
             
-            trip_id = current_trip['trip_id']
-            
-            # Count passengers for this trip
+            # 1. Count matched passengers for this SPECIFIC trip
             passenger_count = self.final_passengers.count_documents({"trip_id": trip_id})
             
-            # Move remaining temp_entries to unmatched (ENTRY type - no exit found)
+            # 2. Find ONLY the temp_entries belonging to THIS trip_id
             remaining = list(self.temp_entries.find({
                 "trip_id": trip_id,
                 "bus_id": bus_id
             }))
             
-            print(f"[SEARCH] Found {len(remaining)} unmatched ENTRY records for {bus_id}", flush=True)
+            print(f"   -> Found {len(remaining)} unmatched ENTRY records for this session", flush=True)
             
             unmatched_count = 0
             for entry in remaining:
@@ -325,46 +358,46 @@ class SimplifiedBusTracker:
                     "trip_id": trip_id,
                     "bus_id": bus_id,
                     "route_name": entry.get('route_name', self.route_name),
-                    "type": "ENTRY",  # These are ENTRY faces that never got an EXIT match
-                    "trip_start_time": current_trip['start_time'],
+                    "type": "ENTRY",
+                    "trip_start_time": session.get('start_time'),
                     "face_id": entry.get('face_id', 0),
                     "face_embedding": entry.get('face_embedding', []),
                     "embedding_size": entry.get('embedding_size', 0),
                     "location": entry.get('entry_location', {}),
                     "timestamp": entry.get('entry_timestamp'),
                     "best_similarity_found": 0.0,
-                    "reason": "Trip ended - no exit match found",
+                    "reason": "Session ended automatically",
                     "created_at": datetime.now()
                 }
                 self.unmatched_passengers.insert_one(unmatched_entry)
                 unmatched_count += 1
-                print(f"   -> Moved ENTRY face_id={entry.get('face_id')} to unmatchedPassengers", flush=True)
             
-            # Delete temp entries for this trip to prevent carryover to next trip
+            # 3. Delete ONLY the temp entries for THIS trip_id
             deleted_count = self.temp_entries.delete_many({"trip_id": trip_id}).deleted_count
-            print(f"[DEL] Deleted {deleted_count} temp_entries for trip {trip_id}", flush=True)
+            print(f"   -> Deleted {deleted_count} temp_entries for {trip_id}", flush=True)
             
-            # Update trip session
+            # 4. Update the Trip Session record
             self.trip_sessions.update_one(
-                {"_id": current_trip['_id']},
+                {"_id": session['_id']},
                 {
                     "$set": {
                         "status": "completed",
                         "end_time": datetime.utcnow(),
                         "total_passengers": passenger_count,
-                        "total_unmatched": unmatched_count
+                        "total_unmatched": unmatched_count,
+                        "closed_at": datetime.now()
                     }
                 }
             )
             
-            print(f"[OK] Ended trip for {bus_id}: {trip_id}", flush=True)
-            print(f"   Passengers: {passenger_count}, Unmatched: {unmatched_count}", flush=True)
-            
-            # Remove from current trips
-            del self.current_trips[bus_id]
+            # 5. If this was the 'current' trip in memory, remove it
+            if bus_id in self.current_trips and self.current_trips[bus_id]['trip_id'] == trip_id:
+                del self.current_trips[bus_id]
+                
+            print(f"[OK] Session {trip_id} finalized. Unmatched moved: {unmatched_count}", flush=True)
             return True
         except Exception as e:
-            print(f"[ERROR] Error ending trip for {bus_id}: {e}", flush=True)
+            print(f"[ERROR] Error closing session {trip_id}: {e}", flush=True)
             return False
     
     # Removed: get_current_route_info() - Replaced by DynamicScheduleManager
@@ -1444,9 +1477,14 @@ bus_tracker = SimplifiedBusTracker()
 
 # Add dynamic schedule manager (replaces old trip_scheduler)
 schedule_manager = DynamicScheduleManager()
+
+# Connect scheduler events to tracker cleanup logic
+schedule_manager.on_trip_start = lambda bus, tid, dir: bus_tracker.start_new_trip(bus_id=bus)
+schedule_manager.on_trip_end = bus_tracker.end_current_trip
+
 schedule_manager.start_scheduler_thread()
 
-print("[OK] Using DynamicScheduleManager for automated trip scheduling", flush=True)
+print("[OK] Using DynamicScheduleManager for automated trip scheduling & cleanup", flush=True)
 
 # Power Management Functions
 def get_power_config(bus_id):
@@ -2050,46 +2088,68 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
     # All CRUD operations moved to Node.js backend
 
 def run_background_checks():
-    """Background thread to check for expired trips and clean up temp entries"""
-    print("[BG] Starting background trip monitor...", flush=True)
+    """
+    TRIP-WISE MONITOR: Background thread to scan ALL active sessions in the database.
+    If a session is active in DB but its scheduled time is over, close it!
+    """
+    print("[BG] Starting session-wise trip monitor...", flush=True)
+    last_housekeeping = datetime.now() - timedelta(hours=1)
+    
     while True:
         try:
-            time.sleep(60) # Check every minute
+            time.sleep(60) # Scan every minute
+            now = datetime.now()
+            current_hhmm = now.strftime("%H:%M")
             
-            # Iterate through all buses with active trips
-            active_buses = list(bus_tracker.current_trips.keys())
+            # --- HOURLY HOUSEKEEPING (STRAY DATA) ---
+            if (now - last_housekeeping).total_seconds() > 3600:
+                print(f"[BG] Periodic Housekeeping: Cleaning up orphaned temp entries older than 6 hours...", flush=True)
+                bus_tracker.cleanup_old_temp_entries(hours_old=6)
+                last_housekeeping = now
             
-            if not active_buses:
+            # --- SESSION-WISE SCAN ---
+            # Fetch ALL sessions that are currently 'active' in the database
+            active_sessions = list(bus_tracker.trip_sessions.find({"status": "active"}))
+            
+            if not active_sessions:
                 continue
                 
-            current_time = datetime.now()
-            current_hhmm = current_time.strftime("%H:%M")
-            
-            for bus_id in active_buses:
-                # Check if this bus should still be active according to schedule
-                is_active_time = False
+            for session in active_sessions:
+                bus_id = session.get('bus_id')
+                trip_id = session.get('trip_id')
+                session_start = session.get('start_time')
                 
+                if not bus_id or not trip_id:
+                    continue
+
+                # 1. Logic: If the session meta-data says it should be over, close it.
                 if schedule_manager:
-                    # Get fresh windows from DB/Schedule Manager
+                    # Get schedule windows for this specific bus
                     windows = schedule_manager.get_todays_trip_windows(bus_id)
                     
+                    is_active_time = False
                     if not windows:
-                        # If no windows at all today, trip shouldn't be active? 
-                        # Or maybe it's a manual trip. 
-                        # For safety, if we have an active trip but no schedule, we might let it run 
-                        # UNLESS we want to enforce strictly.
-                        # Giving benefit of doubt for manual trips:
-                        pass 
-                    
+                        # No windows at all for this bus today? 
+                        # If session started more than 30 mins ago, it's likely a stale leftover from yesterday.
+                        if (now - session_start).total_seconds() > 1800:
+                            print(f"[BG] Session {trip_id} has no valid windows today. Closing stale session.", flush=True)
+                            bus_tracker.close_trip_session(bus_id, trip_id)
+                        continue
+
+                    # Check if current time falls into any scheduled window
                     for window in windows:
                         if bus_tracker.is_within_trip_schedule(current_hhmm, window['start_time'], window['end_time']):
                             is_active_time = True
                             break
                     
-                    # If we checked windows and none matched, then we should end the trip
-                    if windows and not is_active_time:
-                        print(f"[BG] Auto-ending trip for {bus_id} - Outside schedule (checked {len(windows)} windows)", flush=True)
-                        bus_tracker.end_current_trip(bus_id=bus_id)
+                    # 2. If it's NOT active time, and the session has been running for at least 15 mins
+                    if not is_active_time:
+                        if (now - session_start).total_seconds() > 900:
+                            print(f"[BG] Session {trip_id} is outside scheduled windows. Closing.", flush=True)
+                            bus_tracker.close_trip_session(bus_id, trip_id)
+            
+        except Exception as e:
+            print(f"[BG] Error in session-wise monitor: {e}", flush=True)
                         
         except Exception as e:
             print(f"[BG] Error in background monitor: {e}", flush=True)
