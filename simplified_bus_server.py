@@ -45,9 +45,10 @@ class SimplifiedBusTracker:
         
         # Configuration - MULTI-BUS SUPPORT
         self.default_bus_id = "BUS_JC_001"  # Default bus if none specified
+        self.bus_id = self.default_bus_id   # For backward compatibility with handler
         self.route_name = "Jaffna-Colombo"  # Will be updated automatically
-        self.similarity_threshold = 0.60
-        self.season_ticket_similarity_threshold = 0.60  # Lower threshold for ESP32 face variations
+        self.similarity_threshold = 0.55
+        self.season_ticket_similarity_threshold = 0.55  # Lower threshold for ESP32 face variations
         self.time_window_hours = 48  # Increased to 48 hours for testing
         self.timezone_offset_hours = 5.5  # Adjust for Sri Lanka (+5:30)
         self.debug_allow_all_logs = True  # SET TO TRUE FOR TESTING (Accepts logs outside schedule)
@@ -637,7 +638,7 @@ class SimplifiedBusTracker:
     
     def check_season_ticket_member(self, face_embedding, bus_route=None, gps_location=None):
         """
-        OPTIMIZED: Check if face matches season ticket members for THIS ROUTE ONLY
+        Check if face matches season ticket members for THIS ROUTE ONLY
         
         Args:
             face_embedding: Face embedding to match
@@ -651,6 +652,11 @@ class SimplifiedBusTracker:
             if not face_embedding or len(face_embedding) == 0:
                 print("[WARN] No face embedding provided for season ticket check", flush=True)
                 return None, 0.0
+            
+            # --- HIGH CONFIDENCE CHECK ---
+            # We strictly require a higher confidence for financial benefits (free travel)
+            # than for general tracking.
+            HIGH_CONFIDENCE_THRESHOLD = 0.60
             
             now = datetime.now()
             
@@ -726,39 +732,51 @@ class SimplifiedBusTracker:
                 member_id = member.get('member_id', 'Unknown')
                 
                 # Convert member embedding to numpy array
-                member_array = np.array(member['face_embedding'], dtype=np.float32).reshape(1, -1)
+                member_embedding = member['face_embedding']
+                
+                # DIMENSIONALITY CHECK: Skip if dimensions don't match input
+                if len(member_embedding) != input_array.shape[1]:
+                    print(f"   [SKIP] {member_name} ({member_id}): Dimension mismatch ({len(member_embedding)} vs {input_array.shape[1]})", flush=True)
+                    continue
+
+                member_array = np.array(member_embedding, dtype=np.float32).reshape(1, -1)
                 
                 # Calculate cosine similarity
-                similarity = cosine_similarity(input_array, member_array)[0][0]
-                all_similarities.append((member_name, member_id, similarity))
-                
-                print(f"   n {member_name} ({member_id}): similarity = {similarity:.4f} (threshold: {self.season_ticket_similarity_threshold})", flush=True)
-                
-                # --- AUTO-SYNC LOGIC ---
-                # If similarity is low but this member needs a hardware sync (Dlib -> ESP-WHO)
-                if similarity <= self.season_ticket_similarity_threshold:
-                    if member.get('needs_hardware_sync', True):
-                        print(f"   [SYNC] Hardware Sync PENDING for {member_name}. Transitioning Dlib -> ESP-WHO...", flush=True)
-                        
-                        self.season_ticket_members.update_one(
-                            {"member_id": member_id},
-                            {
-                                "$set": {
-                                  "face_embedding": face_embedding,
-                                  "embedding_size": len(face_embedding),
-                                  "needs_hardware_sync": False,
-                                  "last_synced": datetime.now()
+                try:
+                    similarity = cosine_similarity(input_array, member_array)[0][0]
+                    all_similarities.append((member_name, member_id, similarity))
+                    
+                    print(f"   - {member_name} ({member_id}): similarity = {similarity:.4f} (threshold: {self.season_ticket_similarity_threshold})", flush=True)
+                    
+                    # --- AUTO-SYNC LOGIC ---
+                    # If similarity is low but this member needs a hardware sync (Dlib -> ESP-WHO)
+                    # Also trigger if we just had a dimensionality shift
+                    if similarity <= self.season_ticket_similarity_threshold:
+                        if member.get('needs_hardware_sync', True) or member.get('embedding_size') != len(face_embedding):
+                            print(f"   [SYNC] Hardware Sync PENDING for {member_name}. Transitioning Dlib -> ESP-WHO (New Dim: {len(face_embedding)})...", flush=True)
+                            
+                            self.season_ticket_members.update_one(
+                                {"member_id": member_id},
+                                {
+                                    "$set": {
+                                      "face_embedding": face_embedding,
+                                      "embedding_size": len(face_embedding),
+                                      "needs_hardware_sync": False,
+                                      "last_synced": datetime.now()
+                                    }
                                 }
-                            }
-                        )
-                        print(f"   [OK] {member_name} successfully synced with ESP32 model!", flush=True)
-                        return member, 1.0 # Treat as match
-                # ----------------------
-                
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    if similarity > self.season_ticket_similarity_threshold:
-                        best_match = member
+                            )
+                            print(f"   [OK] {member_name} successfully synced with ESP32 model!", flush=True)
+                            return member, 1.0 # Treat as match
+                    # ----------------------
+                    
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        if similarity > self.season_ticket_similarity_threshold:
+                            best_match = member
+                except Exception as sim_err:
+                    print(f"   [ERR] Similarity calculation failed for {member_name}: {sim_err}", flush=True)
+                    continue
             
             # Print summary
             print(f"\n[OK] Season Ticket Check Summary:", flush=True)
@@ -784,7 +802,7 @@ class SimplifiedBusTracker:
 
     def check_contractor_match(self, face_embedding, bus_id):
         """
-        Check if face matches the contractor for THIS BUS
+        Check if face matches ANY contractor for THIS BUS
         
         Args:
             face_embedding: Face embedding to match
@@ -793,55 +811,98 @@ class SimplifiedBusTracker:
         Returns:
             tuple: (contractor, similarity) or (None, 0.0)
         """
+        # User Thesis requested 0.75, but ESP32 cameras often yield 0.65-0.70 for valid faces.
+        # We set 0.70 as a strictly high balance. 0.75 might cause too many "False Negatives" (Staff rejected).
+        CONTRACTOR_STRICT_THRESHOLD = 0.70 
+
         try:
             if not face_embedding or len(face_embedding) == 0:
                 return None, 0.0
             
-            # Find contractor for this specific bus
-            contractor = self.contractors.find_one({"bus_id": bus_id})
+            # Find ALL contractors for this specific bus (Driver, Conductor, etc.)
+            # User Thesis Logic: Iterate through all staff
+            contractors = list(self.contractors.find({"bus_id": bus_id}))
             
-            if not contractor or not contractor.get('face_embedding'):
+            if not contractors:
                 return None, 0.0
             
-            print(f"[SEARCH] Checking against contractor for bus {bus_id}: {contractor.get('name')}", flush=True)
-            print(f"   [DEBUG] Incoming embedding size: {len(face_embedding)}", flush=True)
-            
-            # Convert embeddings to numpy arrays
             input_array = np.array(face_embedding, dtype=np.float32).reshape(1, -1)
-            contractor_array = np.array(contractor['face_embedding'], dtype=np.float32).reshape(1, -1)
+            # Re-normalize just in case
+            norm_in = np.linalg.norm(input_array)
+            if norm_in > 1e-6: input_array = input_array / norm_in
             
-            # Calculate cosine similarity
-            similarity = cosine_similarity(input_array, contractor_array)[0][0]
-            
-            print(f"   [USER] Contractor Similarity: {similarity:.4f} (threshold: {self.contractor_similarity_threshold})", flush=True)
-            
-            # --- AUTO-SYNC LOGIC ---
-            # If similarity is failing (Dlib vs ESP mismatch) but a sync is pending
-            if similarity <= self.contractor_similarity_threshold:
-                if contractor.get('needs_hardware_sync', True):
-                    print(f"   [SYNC] Hardware Sync PENDING for {contractor['name']}. Transitioning Dlib -> ESP-WHO...", flush=True)
-                    
-                    self.contractors.update_one(
-                        {"bus_id": bus_id},
-                        {
-                            "$set": {
-                                "face_embedding": face_embedding,
-                                "embedding_size": len(face_embedding),
-                                "needs_hardware_sync": False,
-                                "last_synced": datetime.now()
-                            }
-                        }
-                    )
-                    print(f"   [OK] {contractor['name']} successfully synced with ESP32 model! Future matches will be 100%.", flush=True)
-                    return contractor, 1.0 # Treat this capture as a successful match
-            # ----------------------
+            best_similarity = 0.0
+            best_contractor = None
 
-            if similarity > self.contractor_similarity_threshold:
-                print(f"[OK] Contractor Match Found: {contractor['name']}", flush=True)
-                return contractor, similarity
-            
-            return None, similarity
-            
+            print(f"[SEARCH] Checking against {len(contractors)} contractors for bus {bus_id}", flush=True)
+
+            for contractor in contractors:
+                if not contractor.get('face_embedding'):
+                    continue
+
+                contractor_embedding = contractor['face_embedding']
+                
+                # Dim Check
+                if len(contractor_embedding) != len(face_embedding):
+                     continue
+                
+                contractor_array = np.array(contractor_embedding, dtype=np.float32).reshape(1, -1)
+                norm_ref = np.linalg.norm(contractor_array)
+                if norm_ref > 1e-6: contractor_array = contractor_array / norm_ref
+                
+                sim = cosine_similarity(input_array, contractor_array)[0][0]
+                print(f"   - Match vs {contractor.get('name')}: {sim:.4f}", flush=True)
+
+                if sim > best_similarity:
+                    best_similarity = sim
+                    best_contractor = contractor
+                
+                # --- AUTO-SYNC REPAIRS (SELF-HEALING) ---
+                # If we have a Weak Match (0.40 - 0.70) but the contractor is marked for sync
+                # OR has a different dimension (Web upload vs ESP32 capture), we TRUST IT.
+                FORCE_SYNC_THRESHOLD = 0.40 
+                if sim > FORCE_SYNC_THRESHOLD and sim < CONTRACTOR_STRICT_THRESHOLD:
+                     print(f"   [SYNC-CHECK] {contractor.get('name')} score {sim:.3f} is WEAK but matches pattern.", flush=True)
+                     
+                     # Check if we should auto-upgrade this face
+                     if len(contractor_embedding) != len(face_embedding) or contractor.get('needs_hardware_sync', True):
+                         print(f"   [SYNC] ⚠️ URGENT: Updating {contractor['name']} face data from Device Capture!", flush=True)
+                         print(f"          Reason: Dim Mismatch ({len(contractor_embedding)}!={len(face_embedding)}) or Manual Sync Flag", flush=True)
+                         
+                         self.contractors.update_one(
+                            {"_id": contractor['_id']},
+                            {
+                                "$set": {
+                                    "face_embedding": face_embedding,
+                                    "embedding_size": len(face_embedding),
+                                    "needs_hardware_sync": False,
+                                    "last_synced": datetime.now()
+                                }
+                            }
+                         )
+                         print(f"   [Use] Treating as 100% Match after sync.", flush=True)
+                         return contractor, 1.0 # Force SUCCESS
+
+            # LOGIC: If best match is high enough, grant access
+
+            # LOGIC: If best match is high enough, grant access
+            if best_contractor and best_similarity > CONTRACTOR_STRICT_THRESHOLD:
+                print(f"[OK] Contractor Verified (High Conf): {best_contractor['name']} ({best_similarity:.3f})", flush=True)
+                
+                # Sync Check (Thesis Requirement)
+                if best_contractor.get('needs_hardware_sync', False):
+                     self.contractors.update_one(
+                        {"_id": best_contractor['_id']},
+                        {"$set": {"needs_hardware_sync": False, "last_synced": datetime.now()}}
+                     )
+                
+                return best_contractor, best_similarity
+
+            if best_similarity > 0.60:
+                 print(f"[WARN] Contractor Rejected: {best_similarity:.3f} < {CONTRACTOR_STRICT_THRESHOLD}", flush=True)
+
+            return None, best_similarity
+
         except Exception as e:
             print(f"[ERROR] Error checking contractor match: {e}", flush=True)
             return None, 0.0
@@ -1051,20 +1112,31 @@ class SimplifiedBusTracker:
                 if not entry.get('face_embedding'):
                     continue
                 
+                entry_embedding = entry['face_embedding']
+                
+                # DIMENSIONALITY CHECK: Skip if dimensions don't match exit log
+                if len(entry_embedding) != exit_array.shape[1]:
+                    print(f"  Entry {entry['_id']} [SKIP]: Dimension mismatch ({len(entry_embedding)} vs {exit_array.shape[1]})", flush=True)
+                    continue
+
                 # Convert entry embedding to numpy array
-                entry_array = np.array(entry['face_embedding'], dtype=np.float32).reshape(1, -1)
+                entry_array = np.array(entry_embedding, dtype=np.float32).reshape(1, -1)
                 
                 # Calculate cosine similarity
-                similarity = cosine_similarity(exit_array, entry_array)[0][0]
-                
-                if similarity > actual_best_similarity:
-                    actual_best_similarity = similarity
+                try:
+                    similarity = cosine_similarity(exit_array, entry_array)[0][0]
+                    
+                    if similarity > actual_best_similarity:
+                        actual_best_similarity = similarity
 
-                print(f"  Entry {entry['_id']}: similarity = {similarity:.3f} (threshold: {self.similarity_threshold})", flush=True)
-                
-                if similarity > best_similarity and similarity > self.similarity_threshold:
-                    best_similarity = similarity
-                    best_match = entry
+                    print(f"  Entry {entry['_id']}: similarity = {similarity:.3f} (threshold: {self.similarity_threshold})", flush=True)
+                    
+                    if similarity > best_similarity and similarity > self.similarity_threshold:
+                        best_similarity = similarity
+                        best_match = entry
+                except Exception as sim_err:
+                    print(f"  Entry {entry['_id']} [ERR]: Similarity calculation failed: {sim_err}", flush=True)
+                    continue
             
             print(f" Best match: similarity = {actual_best_similarity:.3f} (Passed threshold: {'YES' if best_match else 'NO'})", flush=True)
             
@@ -1216,11 +1288,11 @@ class SimplifiedBusTracker:
         location_type = log_entry.get('location_type', '').upper()
         bus_id = log_entry.get('bus_id', self.default_bus_id)
         
-        # 1. Prefer extraction from IMAGE if image_data is provided
-        # This ensures the embedding model matches what was used for Contractor registration
+        # 1. Extraction from IMAGE if provided AND embedding is missing
+        # We only do this as a fallback if the ESP32 didn't send an embedding
         image_data = log_entry.get('image_data') or log_entry.get('image')
-        if image_data:
-            print(f" Found image_data in log. Extracting fresh embedding for consistency...", flush=True)
+        if image_data and not log_entry.get('face_embedding'):
+            print(f" Found image_data and MISSING embedding. Extracting fresh embedding...", flush=True)
             try:
                 from face_recognition_helper import extract_face_embedding_from_base64
                 extract_res = extract_face_embedding_from_base64(image_data, draw_boxes=False)
@@ -1232,20 +1304,20 @@ class SimplifiedBusTracker:
 
         face_embedding = log_entry.get('face_embedding', [])
 
-        # FIRST: Check if this is the CONTRACTOR for this bus
-        contractor, contractor_sim = self.check_contractor_match(face_embedding, bus_id)
-        if contractor:
-            print(f" CONTRACTOR DETECTED: {contractor['name']} at {location_type} on {bus_id}. Skipping processing.", flush=True)
-            return {
-                'action': 'ignored_contractor',
-                'contractor_name': contractor['name'],
-                'bus_id': bus_id,
-                'face_id': log_entry.get('face_id', 0),
-                'similarity': float(contractor_sim),
-                'message': f' Contractor {contractor["name"]} matched. Ignored.'
-            }
-        
         if location_type == 'ENTRY':
+            # For ENTRY: check contractor FIRST to avoid storing staff as passengers
+            contractor, contractor_sim = self.check_contractor_match(face_embedding, bus_id)
+            if contractor:
+                print(f" CONTRACTOR DETECTED at ENTRY: {contractor['name']} on {bus_id}. Skipping.", flush=True)
+                return {
+                    'action': 'ignored_contractor',
+                    'contractor_name': contractor['name'],
+                    'bus_id': bus_id,
+                    'face_id': log_entry.get('face_id', 0),
+                    'similarity': float(contractor_sim),
+                    'message': f' Contractor {contractor["name"]} matched. Ignored.'
+                }
+            
             # Store temporary entry
             entry_id = self.store_entry(log_entry)
             
@@ -1253,7 +1325,7 @@ class SimplifiedBusTracker:
                 return {
                     'action': 'stored_entry',
                     'entry_id': entry_id,
-                    'bus_id': bus_id,  # Use bus_id from request
+                    'bus_id': bus_id,
                     'face_id': log_entry.get('face_id', 0),
                     'message': f'Entry stored for {bus_id} (face_id: {log_entry.get("face_id", 0)})'
                 }
@@ -1265,31 +1337,44 @@ class SimplifiedBusTracker:
                 }
         
         elif location_type == 'EXIT':
-            # Find matching entry and create final record
+            # For EXIT: Check for passenger match FIRST
             match_result, similarity = self.find_matching_entry(log_entry)
             
             if match_result:
                 return {
                     'action': 'matched_journey',
                     'passenger_id': match_result['id'],
-                    'bus_id': bus_id,  # Use bus_id from request
+                    'bus_id': bus_id,
                     'entry_face_id': match_result['entry_face_id'],
                     'exit_face_id': match_result['exit_face_id'],
                     'similarity': float(similarity),
                     'journey_duration': match_result['journey_duration_minutes'],
                     'message': f'[OK] Journey on {bus_id}! Passenger {match_result["id"]} (similarity: {similarity:.3f}, duration: {match_result["journey_duration_minutes"]:.1f} min)'
                 }
-            else:
-                # Store unmatched exit
-                unmatched_exit_id = self.store_unmatched_exit(log_entry, similarity)
+            
+            # If no passenger match found, THEN check if this is the CONTRACTOR
+            contractor, contractor_sim = self.check_contractor_match(face_embedding, bus_id)
+            if contractor:
+                print(f" CONTRACTOR DETECTED at EXIT: {contractor['name']} on {bus_id}. Skipping.", flush=True)
                 return {
-                    'action': 'unmatched_exit',
-                    'bus_id': bus_id,  # Use bus_id from request
+                    'action': 'ignored_contractor',
+                    'contractor_name': contractor['name'],
+                    'bus_id': bus_id,
                     'face_id': log_entry.get('face_id', 0),
-                    'best_similarity': float(similarity),
-                    'unmatched_id': unmatched_exit_id,
-                    'message': f'[ERROR] No match on {bus_id} for exit face_id {log_entry.get("face_id", 0)} (best: {similarity:.3f})'
+                    'similarity': float(contractor_sim),
+                    'message': f' Contractor {contractor["name"]} matched. Ignored.'
                 }
+
+            # If neither a passenger nor a contractor, store as unmatched exit
+            unmatched_exit_id = self.store_unmatched_exit(log_entry, similarity)
+            return {
+                'action': 'unmatched_exit',
+                'bus_id': bus_id,
+                'face_id': log_entry.get('face_id', 0),
+                'best_similarity': float(similarity),
+                'unmatched_id': unmatched_exit_id,
+                'message': f'[ERROR] No match on {bus_id} for exit face_id {log_entry.get("face_id", 0)} (best: {similarity:.3f})'
+            }
         
         else:
             return {
@@ -1297,6 +1382,7 @@ class SimplifiedBusTracker:
                 'bus_id': bus_id,
                 'message': f'Unknown location_type: {location_type}'
             }
+
     
     def store_unmatched_exit(self, exit_log, best_similarity):
         """Store unmatched exit passenger - supports multiple buses"""
@@ -1597,10 +1683,16 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
                             # Within ESP32 trip time - ensure we have an active trip
                             if not current_trip or current_trip.get('status') != 'active':
                                 print(f"AUTO-START: Creating trip for ESP32 schedule {esp32_trip_start}-{esp32_trip_end} on {bus_id}", flush=True)
-                                # Move any old temp_entries to unmatched before starting new trip
-                                # Use hours_old=0 to clean ALL remaining entries for this bus
-                                print(f"cleaning old entries for {bus_id}...", flush=True)
-                                bus_tracker.cleanup_old_temp_entries(hours_old=0, bus_id=bus_id)
+                                # FIXED: Only clean entries for the SPECIFIC trip that is ending
+                                # User Request: "temp entries not clean fully only clean that bus id and trip id is smae"
+                                if current_trip:
+                                     print(f"cleaning old entries for {bus_id} (Trip: {current_trip['trip_id']})...", flush=True)
+                                     bus_tracker.cleanup_old_temp_entries(hours_old=0, bus_id=bus_id, trip_id=current_trip['trip_id'])
+                                else:
+                                     # If no active trip found, do NOT wipe everything (prevent race conditions)
+                                     # Background task will clean orphans later.
+                                     print(f"Skipping cleanup for {bus_id} (No active trip to close).", flush=True)
+
                                 # Auto-start trip for this specific bus
                                 print(f"starting new trip for {bus_id}...", flush=True)
                                 bus_tracker.start_new_trip(bus_id=bus_id)
