@@ -35,6 +35,15 @@ from utils.dynamic_schedule_manager import DynamicScheduleManager
 # embeddings.  The CSV logger in csv_logger.c hard-caps at 128 as well.
 EXPECTED_EMBEDDING_DIM = 128
 
+# ── Trip lifecycle constants ──────────────────────────────────────────────────
+# After the scheduled window ends, the trip enters the "ending" state.
+# During this grace window:
+#   • EXIT logs are still accepted so passengers who alight late can be matched.
+#   • ENTRY logs are rejected (bus has arrived; no new boardings).
+# After TRIP_END_GRACE_MINUTES the background thread calls close_trip_session()
+# which moves all remaining temp_entries for THAT trip only → unmatchedPassengers.
+TRIP_END_GRACE_MINUTES = 30
+
 
 def validate_esp32_embedding(embedding, context=""):
     """
@@ -166,7 +175,25 @@ class SimplifiedBusTracker:
             self.season_ticket_members.create_index(
                 [("is_active", 1), ("valid_from", 1), ("valid_until", 1)]
             )
-            self.contractors.create_index([("bus_id", 1)], unique=True)
+            # ── Contractors index fix ────────────────────────────────────────
+            # The old unique=True on bus_id meant only ONE contractor record could
+            # exist per bus.  A second insert (Conductor after Driver) silently
+            # failed with a duplicate-key error, so only the first staff member
+            # was ever stored and compared.  Drop the unique index and replace it
+            # with a non-unique bus_id index + a unique compound (bus_id, name).
+            try:
+                self.contractors.drop_index("bus_id_1")
+                print("[OK] Dropped old unique contractors.bus_id index", flush=True)
+            except Exception:
+                pass  # index didn't exist or was already corrected
+            self.contractors.create_index(
+                [("bus_id", 1)]
+            )  # non-unique: multiple staff per bus
+            self.contractors.create_index(
+                [("bus_id", 1), ("name", 1)],
+                unique=True,  # unique per bus+staff name
+            )
+            self.contractors.create_index([("is_active", 1)])  # fast active-only filter
 
             print("[OK] Connected to MongoDB - Multi-Bus Tracking Enabled", flush=True)
             print(
@@ -190,10 +217,14 @@ class SimplifiedBusTracker:
                 print(f"[WARN] Route detector initialization failed: {e}", flush=True)
                 self.route_detector = None
 
-            # Initialize contractor similarity threshold
-            self.contractor_similarity_threshold = (
-                0.60  # Consistent with similarity_threshold for bus conditions
-            )
+            # ── Contractor similarity threshold ──────────────────────────────
+            # Single source of truth — check_contractor_match() MUST use this
+            # value instead of its own local constant (which caused a split where
+            # 0.60 was documented but 0.70 was actually enforced, silently rejecting
+            # valid staff faces that scored 0.60-0.70).
+            # 0.60 is correct: same-camera same-person scores 0.70-0.85;
+            # 0.60 gives a 0.10 safety margin without rejecting valid matches.
+            self.contractor_similarity_threshold = 0.60
 
             # Load active trips from database
             try:
@@ -263,9 +294,12 @@ class SimplifiedBusTracker:
         if bus_id is None:
             bus_id = self.default_bus_id
         try:
-            # Find active trip for this bus
+            # Find active OR ending trip for this bus.
+            # "ending" sessions must be restored too so that EXIT logs arriving
+            # after the schedule window closes can still be matched within the
+            # 30-minute grace period after a server restart.
             active_trip = self.trip_sessions.find_one(
-                {"bus_id": bus_id, "status": "active"}
+                {"bus_id": bus_id, "status": {"$in": ["active", "ending"]}}
             )
 
             if active_trip:
@@ -336,16 +370,17 @@ class SimplifiedBusTracker:
                     # Start fresh trip
                     self.start_new_trip(bus_id=bus_id)
                 else:
+                    restored_status = active_trip.get("status", "active")
                     self.current_trips[bus_id] = {
                         "trip_id": active_trip["trip_id"],
                         "bus_id": bus_id,
                         "route_name": active_trip.get("route_name", self.route_name),
                         "start_time": active_trip["start_time"],
-                        "status": "active",
+                        "status": restored_status,  # preserve "ending" after restart
                         "_id": active_trip["_id"],
                     }
                     print(
-                        f"[LOC] Loaded active trip for {bus_id}: {active_trip['trip_id']}",
+                        f"[LOC] Loaded {restored_status} trip for {bus_id}: {active_trip['trip_id']}",
                         flush=True,
                     )
             else:
@@ -492,12 +527,15 @@ class SimplifiedBusTracker:
                 self.unmatched_passengers.insert_one(unmatched_entry)
                 unmatched_count += 1
 
-            # 3. Delete ONLY the temp entries for THIS trip_id
+            # 3. Delete ONLY the temp entries for THIS trip_id AND this bus_id.
+            # NOTE: bus_id filter is REQUIRED — without it a rare trip_id collision
+            # across two buses would silently delete entries from the wrong bus.
             deleted_count = self.temp_entries.delete_many(
-                {"trip_id": trip_id}
+                {"trip_id": trip_id, "bus_id": bus_id}
             ).deleted_count
             print(
-                f"   -> Deleted {deleted_count} temp_entries for {trip_id}", flush=True
+                f"   -> Deleted {deleted_count} temp_entries for {trip_id} / {bus_id}",
+                flush=True,
             )
 
             # 4. Update the Trip Session record
@@ -528,6 +566,78 @@ class SimplifiedBusTracker:
             return True
         except Exception as e:
             print(f"[ERROR] Error closing session {trip_id}: {e}", flush=True)
+            return False
+
+    def mark_trip_ending(self, bus_id, trip_id):
+        """
+        Transition a trip from 'active' → 'ending' to start the 30-minute grace window.
+
+        Trip state machine
+        ──────────────────
+          active  ──(schedule window ends)──►  ending  ──(TRIP_END_GRACE_MINUTES)──►  [close_trip_session]
+                                                                                              ↓
+                                                                              temp_entries → unmatchedPassengers
+                                                                              status      → "completed"
+
+        While 'ending':
+          • EXIT logs are still accepted — passengers who boarded but haven't alighted
+            yet can still be matched within the grace window.
+          • ENTRY logs are REJECTED — the bus has arrived; no new boardings.
+          • The in-memory current_trips entry is kept (status set to "ending") so that
+            find_matching_entry() can still resolve the trip_id for EXIT matching.
+        """
+        try:
+            session = self.trip_sessions.find_one(
+                {"trip_id": trip_id, "bus_id": bus_id}
+            )
+            if not session:
+                print(
+                    f"[WARN] mark_trip_ending: Session {trip_id} not found in DB",
+                    flush=True,
+                )
+                return False
+
+            current_status = session.get("status")
+            if current_status != "active":
+                print(
+                    f"[WARN] mark_trip_ending: Session {trip_id} is already "
+                    f"'{current_status}' — nothing to do.",
+                    flush=True,
+                )
+                return False
+
+            now_utc = datetime.utcnow()
+            grace_ends_at = now_utc + timedelta(minutes=TRIP_END_GRACE_MINUTES)
+
+            self.trip_sessions.update_one(
+                {"_id": session["_id"]},
+                {
+                    "$set": {
+                        "status": "ending",
+                        "end_detected_at": now_utc,
+                        "grace_ends_at": grace_ends_at,
+                    }
+                },
+            )
+
+            # Mirror the status change in the in-memory cache so that
+            # find_matching_entry() can still resolve this trip for EXIT logs.
+            if (
+                bus_id in self.current_trips
+                and self.current_trips[bus_id]["trip_id"] == trip_id
+            ):
+                self.current_trips[bus_id]["status"] = "ending"
+
+            print(
+                f"[BG] Trip {trip_id} → ENDING. "
+                f"Grace window: {TRIP_END_GRACE_MINUTES} min "
+                f"(auto-close at {grace_ends_at.strftime('%H:%M:%S')} UTC).",
+                flush=True,
+            )
+            return True
+
+        except Exception as e:
+            print(f"[ERROR] mark_trip_ending({trip_id}): {e}", flush=True)
             return False
 
     # Removed: get_current_route_info() - Replaced by DynamicScheduleManager
@@ -817,11 +927,19 @@ class SimplifiedBusTracker:
                 )
                 return None, 0.0
 
-            now = datetime.now()
+            # Use UTC so the comparison is consistent with how valid_from / valid_until
+            # are stored (datetime.utcnow() throughout the rest of the codebase).
+            # Using datetime.now() (local Sri Lanka time = UTC+5:30) against UTC-stored
+            # dates would cause valid tickets to appear expired 5.5 hours early.
+            now = datetime.utcnow()
 
-            # 2. Build query for active members
+            # 2. Build query for active members.
+            # is_active uses $ne False (not equal to False) so that member documents
+            # inserted WITHOUT an is_active field are still included.
+            # {"is_active": True} would silently exclude those legacy documents,
+            # making valid season-ticket holders invisible to the face comparison.
             query = {
-                "is_active": True,
+                "is_active": {"$ne": False},
                 "valid_from": {"$lte": now},
                 "valid_until": {"$gte": now},
                 "face_embedding": {"$exists": True, "$ne": []},
@@ -840,31 +958,42 @@ class SimplifiedBusTracker:
                 filtered_members = []
                 for m in all_active_members:
                     is_relevant = False
-                    for vr in m.get("valid_routes", []):
-                        patterns = vr.get("route_patterns", [])
-                        from_l = vr.get("from_location", "").lower()
-                        to_l = vr.get("to_location", "").lower()
 
-                        # Case 1: Direct pattern match
-                        if any(p.lower() in bus_route.lower() for p in patterns):
-                            is_relevant = True
-                            break
+                    # ── FIX: members with NO valid_routes defined are valid everywhere ──
+                    # Previously, an empty / missing valid_routes list caused the inner
+                    # loop to never execute, so is_relevant stayed False and the member
+                    # was silently excluded from ALL face comparisons — they were never
+                    # matched even when their face was a perfect cosine match.
+                    member_routes = m.get("valid_routes")
+                    if not member_routes:
+                        # No route restriction defined → accept on every route
+                        is_relevant = True
+                    else:
+                        for vr in member_routes:
+                            patterns = vr.get("route_patterns", [])
+                            from_l = vr.get("from_location", "").lower()
+                            to_l = vr.get("to_location", "").lower()
 
-                        # Case 2: Bus route name mentions the locations
-                        # (e.g. Jaffna-Colombo bus serves Jaffna-Kodikamam)
-                        if (
-                            from_l
-                            and to_l
-                            and from_l in bus_route.lower()
-                            and to_l in bus_route.lower()
-                        ):
-                            is_relevant = True
-                            break
+                            # Case 1: Direct pattern match
+                            if any(p.lower() in bus_route.lower() for p in patterns):
+                                is_relevant = True
+                                break
 
-                        # Case 3: No patterns defined - Include for check (let RouteDetector validate later)
-                        if not patterns:
-                            is_relevant = True
-                            break
+                            # Case 2: Bus route name mentions the locations
+                            # (e.g. Jaffna-Colombo bus serves Jaffna-Kodikamam)
+                            if (
+                                from_l
+                                and to_l
+                                and from_l in bus_route.lower()
+                                and to_l in bus_route.lower()
+                            ):
+                                is_relevant = True
+                                break
+
+                            # Case 3: No patterns defined in this entry - include
+                            if not patterns:
+                                is_relevant = True
+                                break
 
                     if is_relevant:
                         filtered_members.append(m)
@@ -1006,20 +1135,43 @@ class SimplifiedBusTracker:
         Returns:
             tuple: (contractor, similarity) or (None, 0.0)
         """
-        # User Thesis requested 0.75, but ESP32 cameras often yield 0.65-0.70 for valid faces.
-        # We set 0.70 as a strictly high balance. 0.75 might cause too many "False Negatives" (Staff rejected).
-        CONTRACTOR_STRICT_THRESHOLD = 0.70
-
+        # Use the instance-level threshold set in init_database() (0.60).
+        # A local hard-coded 0.70 was previously used here, which silently
+        # overrode the instance variable and rejected valid staff faces
+        # scoring 0.60-0.70 (common in bus lighting conditions).
+        #
+        # SUSPECT threshold (0.40):
+        # If the best similarity is in the range [0.40, threshold), the face is
+        # "contractor-like" but below the confirmation bar.  This typically means
+        # the contractor's stored embedding came from a different model (web-upload
+        # float32 ONNX vs ESP32 INT8) or extreme lighting change.
+        # Callers use the returned is_suspect flag to suppress storage so that a
+        # contractor face is NEVER written to any collection even on a near-miss.
+        CONTRACTOR_SUSPECT_THRESHOLD = 0.40
         try:
             if not face_embedding or len(face_embedding) == 0:
-                return None, 0.0
+                return None, 0.0, False
 
             # Find ALL contractors for this specific bus (Driver, Conductor, etc.)
             # User Thesis Logic: Iterate through all staff
-            contractors = list(self.contractors.find({"bus_id": bus_id}))
+            # is_active filter: exclude only EXPLICITLY deactivated staff.
+            # Using {"$ne": False} instead of True so that contractor documents
+            # that were inserted WITHOUT an is_active field (the common case for
+            # existing data) are still included.  {"is_active": True} silently
+            # returns 0 results for those legacy docs, making the contractor check
+            # always return None → their ENTRY gets stored → they get billed.
+            contractors = list(
+                self.contractors.find({"bus_id": bus_id, "is_active": {"$ne": False}})
+            )
 
             if not contractors:
-                return None, 0.0
+                print(
+                    f"[WARN] check_contractor_match: 0 contractor records found for "
+                    f"bus_id='{bus_id}'. Check that documents exist and bus_id matches "
+                    f"exactly what the ESP32 sends.",
+                    flush=True,
+                )
+                return None, 0.0, False
 
             # NOTE: ESP32 embeddings are already L2-normalised by transform_mfn_output().
             # Re-normalising is a no-op for cosine similarity (sklearn handles it
@@ -1065,12 +1217,22 @@ class SimplifiedBusTracker:
                 # similar face could be registered as a contractor and bypass fare checks.
                 # Update contractor embeddings deliberately via the admin API instead.
 
-            # LOGIC: If best match is high enough, grant access
-
-            # LOGIC: If best match is high enough, grant access
-            if best_contractor and best_similarity > CONTRACTOR_STRICT_THRESHOLD:
+            # ── Decision: CONFIRMED / SUSPECT / NO-MATCH ─────────────────────
+            # CONFIRMED  similarity >= contractor_similarity_threshold (0.60)
+            #            → face is a known contractor, ignore entirely
+            # SUSPECT    similarity in [CONTRACTOR_SUSPECT_THRESHOLD, 0.60)
+            #            → face is contractor-like (probably same person with
+            #              model-mismatch or extreme lighting); suppress storage
+            #              but do NOT create a journey record
+            # NO-MATCH   similarity < CONTRACTOR_SUSPECT_THRESHOLD (0.40)
+            #            → treat as a regular passenger
+            if (
+                best_contractor
+                and best_similarity >= self.contractor_similarity_threshold
+            ):
                 print(
-                    f"[OK] Contractor Verified (High Conf): {best_contractor['name']} ({best_similarity:.3f})",
+                    f"[OK] Contractor CONFIRMED: {best_contractor['name']} "
+                    f"({best_similarity:.3f} >= {self.contractor_similarity_threshold})",
                     flush=True,
                 )
 
@@ -1086,19 +1248,41 @@ class SimplifiedBusTracker:
                         },
                     )
 
-                return best_contractor, best_similarity
+                return (
+                    best_contractor,
+                    best_similarity,
+                    False,
+                )  # is_suspect=False → confirmed
 
-            if best_similarity > 0.60:
+            if best_contractor and best_similarity >= CONTRACTOR_SUSPECT_THRESHOLD:
+                # Similarity is in the grey zone [0.40, 0.60).
+                # Most likely cause: contractor embedding was registered from the
+                # web app using the float32 ONNX model while the ESP32 sends INT8
+                # embeddings (different embedding spaces → lower cosine similarity
+                # for the same person).  Suppress storage so the contractor is
+                # never written to unmatchedPassengers or temp_entries.
                 print(
-                    f"[WARN] Contractor Rejected: {best_similarity:.3f} < {CONTRACTOR_STRICT_THRESHOLD}",
+                    f"[WARN] Contractor SUSPECT (not stored): {best_contractor['name']} "
+                    f"sim={best_similarity:.3f} — in grey zone "
+                    f"[{CONTRACTOR_SUSPECT_THRESHOLD}, {self.contractor_similarity_threshold}). "
+                    f"Tip: re-register contractor embedding directly from ESP32 camera.",
+                    flush=True,
+                )
+                return best_contractor, best_similarity, True  # is_suspect=True
+
+            # Similarity < 0.40 → treat as a regular passenger
+            if best_similarity > 0:
+                print(
+                    f"[INFO] Contractor check: best={best_similarity:.3f} "
+                    f"< {CONTRACTOR_SUSPECT_THRESHOLD} (suspect floor) — treating as passenger.",
                     flush=True,
                 )
 
-            return None, best_similarity
+            return None, best_similarity, False
 
         except Exception as e:
             print(f"[ERROR] Error checking contractor match: {e}", flush=True)
-            return None, 0.0
+            return None, 0.0, False
 
     # Removed: _get_nearby_stops() - Never called
     # Removed: _get_location_name_variations() - Never called
@@ -1209,15 +1393,37 @@ class SimplifiedBusTracker:
             # Get bus_id from log entry, fallback to default
             bus_id = log_entry.get("bus_id", self.default_bus_id)
 
-            # Ensure we have an active trip for this bus
+            # Ensure we have an active trip for this bus.
+            # ENTRY logs are rejected during the "ending" grace window — the bus has
+            # arrived and is no longer accepting new boardings.
             current_trip = self.get_current_trip_for_bus(bus_id)
-            if not current_trip or current_trip.get("status") != "active":
+            trip_status = current_trip.get("status") if current_trip else None
+
+            if trip_status == "ending":
                 print(
-                    f"[WARN] No active trip for {bus_id}, starting new trip...",
+                    f"[REJECT] ENTRY rejected for {bus_id} — trip "
+                    f"'{current_trip['trip_id']}' is in the 'ending' grace window. "
+                    f"No new boardings accepted.",
+                    flush=True,
+                )
+                return None
+
+            if trip_status != "active":
+                # No active trip found — auto-start one (e.g. first boot, or after a
+                # completed trip with no schedule manager to create the next one).
+                print(
+                    f"[WARN] No active trip for {bus_id} (status={trip_status!r}), "
+                    f"starting new trip...",
                     flush=True,
                 )
                 self.start_new_trip(bus_id=bus_id)
                 current_trip = self.current_trips.get(bus_id)
+                if not current_trip:
+                    print(
+                        f"[ERROR] Failed to start new trip for {bus_id}",
+                        flush=True,
+                    )
+                    return None
 
             # Check if this is a season ticket member at entry
             # OPTIMIZED: Pass route and GPS for targeted checking
@@ -1295,11 +1501,17 @@ class SimplifiedBusTracker:
             # Get bus_id from exit log, fallback to default
             bus_id = exit_log.get("bus_id", self.default_bus_id)
 
-            # Ensure we have an active trip for this bus
+            # Ensure we have an active OR ending trip for this bus.
+            # EXIT logs must still be matched during the 30-minute "ending" grace
+            # window so passengers who boarded but haven't alighted yet are not
+            # wrongly moved to unmatchedPassengers.
             current_trip = self.get_current_trip_for_bus(bus_id)
-            if not current_trip or current_trip.get("status") != "active":
+            trip_status = current_trip.get("status") if current_trip else None
+            if not current_trip or trip_status not in ("active", "ending"):
                 print(
-                    f"[WARN] No active trip for {bus_id} for exit matching", flush=True
+                    f"[WARN] No active/ending trip for {bus_id} for exit matching "
+                    f"(status={trip_status!r})",
+                    flush=True,
                 )
                 return None, 0.0
 
@@ -1663,22 +1875,37 @@ class SimplifiedBusTracker:
             }
 
         if location_type == "ENTRY":
-            # For ENTRY: check contractor FIRST to avoid storing staff as passengers
-            contractor, contractor_sim = self.check_contractor_match(
-                face_embedding, bus_id
+            # ── ENTRY processing ──────────────────────────────────────────────
+            # Priority 1: Contractor / staff face  → IGNORE entirely (nothing stored)
+            # Priority 2: Regular passenger        → store in temp_entries
+            #
+            # check_contractor_match returns (contractor, similarity, is_suspect):
+            #   contractor != None AND is_suspect=False  → confirmed staff
+            #   contractor != None AND is_suspect=True   → grey-zone / model-mismatch
+            #   contractor == None                       → regular passenger
+            # Both confirmed AND suspect contractor faces are suppressed at ENTRY.
+            contractor, contractor_sim, contractor_suspect = (
+                self.check_contractor_match(face_embedding, bus_id)
             )
             if contractor:
+                label = "SUSPECT" if contractor_suspect else "CONFIRMED"
                 print(
-                    f" CONTRACTOR DETECTED at ENTRY: {contractor['name']} on {bus_id}. Skipping.",
+                    f"[STAFF] Contractor {label} at ENTRY: {contractor['name']} "
+                    f"on {bus_id} (sim={contractor_sim:.3f}). Not stored.",
                     flush=True,
                 )
                 return {
                     "action": "ignored_contractor",
                     "contractor_name": contractor["name"],
+                    "contractor_label": label,
                     "bus_id": bus_id,
                     "face_id": log_entry.get("face_id", 0),
                     "similarity": float(contractor_sim),
-                    "message": f" Contractor {contractor['name']} matched. Ignored.",
+                    "is_suspect": contractor_suspect,
+                    "message": (
+                        f"[STAFF] Contractor {label}: {contractor['name']} — "
+                        f"not stored (sim={contractor_sim:.3f})."
+                    ),
                 }
 
             # Store temporary entry
@@ -1700,7 +1927,109 @@ class SimplifiedBusTracker:
                 }
 
         elif location_type == "EXIT":
-            # For EXIT: Check for passenger match FIRST
+            # ── EXIT processing ───────────────────────────────────────────────
+            # Exactly symmetric with ENTRY — contractor faces are NEVER stored
+            # in any collection regardless of which camera sees them.
+            #
+            # Priority 1 (CONFIRMED contractor)  → stale cleanup + IGNORE
+            # Priority 1 (SUSPECT contractor)    → stale cleanup + IGNORE
+            # Priority 2 (regular passenger, entry match found) → JOURNEY RECORD
+            # Priority 3 (regular passenger, no entry match)    → UNMATCHED EXIT
+            #
+            # "SUSPECT" covers the case where the stored contractor embedding was
+            # registered from the web app (float32 ONNX) while the ESP32 sends
+            # INT8 embeddings — different embedding spaces reduce cosine similarity
+            # for the same person.  Suppressing storage prevents the contractor's
+            # face from ever appearing in unmatchedPassengers.
+
+            contractor, contractor_sim, contractor_suspect = (
+                self.check_contractor_match(face_embedding, bus_id)
+            )
+
+            if contractor:
+                # ── confirmed OR suspect contractor → ignore, nothing stored ──
+                label = "SUSPECT" if contractor_suspect else "CONFIRMED"
+                print(
+                    f"[STAFF] Contractor {label} at EXIT: {contractor['name']} "
+                    f"on {bus_id} (sim={contractor_sim:.3f}). Not stored.",
+                    flush=True,
+                )
+
+                # ── Stale temp_entry cleanup ──────────────────────────────────
+                # Under normal flow the ENTRY contractor check prevents any
+                # temp_entry from being created.  But if a previous server
+                # version (or a DB error) let one through, it would be swept
+                # into unmatchedPassengers at trip-end.  Delete it now.
+                # We use the SUSPECT threshold (0.40) as the match bar here so
+                # that even model-mismatch entries are caught.
+                STALE_CLEANUP_THRESHOLD = 0.40
+                try:
+                    current_trip = self.get_current_trip_for_bus(bus_id)
+                    if current_trip:
+                        stale_entries = list(
+                            self.temp_entries.find(
+                                {
+                                    "bus_id": bus_id,
+                                    "trip_id": current_trip["trip_id"],
+                                    "face_embedding": {"$exists": True, "$ne": []},
+                                }
+                            )
+                        )
+                        exit_arr = np.array(face_embedding, dtype=np.float32).reshape(
+                            1, -1
+                        )
+                        deleted_stale = 0
+                        for stale in stale_entries:
+                            try:
+                                stale_arr = np.array(
+                                    stale["face_embedding"], dtype=np.float32
+                                ).reshape(1, -1)
+                                if stale_arr.shape[1] != exit_arr.shape[1]:
+                                    continue
+                                sim = cosine_similarity(exit_arr, stale_arr)[0][0]
+                                if sim >= STALE_CLEANUP_THRESHOLD:
+                                    self.temp_entries.delete_one({"_id": stale["_id"]})
+                                    deleted_stale += 1
+                                    print(
+                                        f"[DEL] Removed stale contractor temp_entry "
+                                        f"{stale['_id']} (sim={sim:.3f})",
+                                        flush=True,
+                                    )
+                            except Exception:
+                                continue
+                        if deleted_stale:
+                            print(
+                                f"[OK] Cleaned up {deleted_stale} stale contractor "
+                                f"temp_entr{'y' if deleted_stale == 1 else 'ies'} "
+                                f"for {contractor['name']} ({label})",
+                                flush=True,
+                            )
+                except Exception as cleanup_err:
+                    print(
+                        f"[WARN] Stale temp_entry cleanup failed (non-fatal): "
+                        f"{cleanup_err}",
+                        flush=True,
+                    )
+                # ─────────────────────────────────────────────────────────────
+
+                return {
+                    "action": "ignored_contractor",
+                    "contractor_name": contractor["name"],
+                    "contractor_label": label,
+                    "bus_id": bus_id,
+                    "face_id": log_entry.get("face_id", 0),
+                    "similarity": float(contractor_sim),
+                    "is_suspect": contractor_suspect,
+                    "message": (
+                        f"[STAFF] Contractor {label} at EXIT: {contractor['name']} — "
+                        f"not stored (sim={contractor_sim:.3f})."
+                    ),
+                }
+
+            # ── Contractor check returned None → treat as regular passenger ──
+            # Only reaches here when similarity < 0.40 (not contractor-like at all).
+
+            # Priority 2: match against a stored entry record
             match_result, similarity = self.find_matching_entry(log_entry)
 
             if match_result:
@@ -1712,28 +2041,15 @@ class SimplifiedBusTracker:
                     "exit_face_id": match_result["exit_face_id"],
                     "similarity": float(similarity),
                     "journey_duration": match_result["journey_duration_minutes"],
-                    "message": f"[OK] Journey on {bus_id}! Passenger {match_result['id']} (similarity: {similarity:.3f}, duration: {match_result['journey_duration_minutes']:.1f} min)",
+                    "message": (
+                        f"[OK] Journey on {bus_id}! "
+                        f"Passenger {match_result['id']} "
+                        f"(similarity: {similarity:.3f}, "
+                        f"duration: {match_result['journey_duration_minutes']:.1f} min)"
+                    ),
                 }
 
-            # If no passenger match found, THEN check if this is the CONTRACTOR
-            contractor, contractor_sim = self.check_contractor_match(
-                face_embedding, bus_id
-            )
-            if contractor:
-                print(
-                    f" CONTRACTOR DETECTED at EXIT: {contractor['name']} on {bus_id}. Skipping.",
-                    flush=True,
-                )
-                return {
-                    "action": "ignored_contractor",
-                    "contractor_name": contractor["name"],
-                    "bus_id": bus_id,
-                    "face_id": log_entry.get("face_id", 0),
-                    "similarity": float(contractor_sim),
-                    "message": f" Contractor {contractor['name']} matched. Ignored.",
-                }
-
-            # If neither a passenger nor a contractor, store as unmatched exit
+            # Priority 3: genuine unmatched passenger (not a contractor, no entry record)
             unmatched_exit_id = self.store_unmatched_exit(log_entry, similarity)
             return {
                 "action": "unmatched_exit",
@@ -1741,7 +2057,11 @@ class SimplifiedBusTracker:
                 "face_id": log_entry.get("face_id", 0),
                 "best_similarity": float(similarity),
                 "unmatched_id": unmatched_exit_id,
-                "message": f"[ERROR] No match on {bus_id} for exit face_id {log_entry.get('face_id', 0)} (best: {similarity:.3f})",
+                "message": (
+                    f"[WARN] No entry match on {bus_id} for "
+                    f"face_id {log_entry.get('face_id', 0)} "
+                    f"(best similarity: {similarity:.3f})"
+                ),
             }
 
         else:
@@ -2253,7 +2573,7 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
             parsed_path = urlparse(self.path)
 
             # ESP32 Face Embedding Extraction Endpoint
-            if parsed_path.path == "/api/extract-face-embedding":
+            if parsed_path.path in ("/api/extract-face-embedding", "/api/python/api/extract-face-embedding"):
                 content_length = int(self.headers.get("Content-Length", 0))
                 print(
                     f"[PHOTO] Incoming face photo: {content_length / 1024:.1f} KB",
@@ -2658,82 +2978,150 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
 
 def run_background_checks():
     """
-    TRIP-WISE MONITOR: Background thread to scan ALL active sessions in the database.
-    If a session is active in DB but its scheduled time is over, close it!
+    TRIP LIFECYCLE MONITOR
+    ──────────────────────
+    Runs every 60 seconds and manages the three-phase trip lifecycle:
+
+      active  ──(schedule window ends)──►  ending  ──(TRIP_END_GRACE_MINUTES)──►  close_trip_session()
+                                                                                          │
+                                                                    temp_entries (this trip only)
+                                                                          │
+                                                                    unmatchedPassengers
+                                                                    status → "completed"
+
+    Phase rules
+    ───────────
+    active  : normal operation; ENTRY + EXIT logs both accepted.
+    ending  : grace window (TRIP_END_GRACE_MINUTES = 30 min).
+              EXIT logs still accepted so late-alighting passengers are matched.
+              ENTRY logs rejected (bus has arrived; no new boardings).
+    completed: closed; no further matching.
+
+    Hourly housekeeping also runs cleanup_old_temp_entries(hours_old=6) to
+    catch any orphaned entries from abnormal shutdowns.
     """
-    print("[BG] Starting session-wise trip monitor...", flush=True)
+    print("[BG] Starting trip lifecycle monitor...", flush=True)
     last_housekeeping = datetime.now() - timedelta(hours=1)
 
     while True:
         try:
             time.sleep(60)  # Scan every minute
             now = datetime.now()
+            now_utc = datetime.utcnow()
             current_hhmm = now.strftime("%H:%M")
 
-            # --- HOURLY HOUSEKEEPING (STRAY DATA) ---
+            # ── HOURLY HOUSEKEEPING: orphaned / very old temp entries ─────────
             if (now - last_housekeeping).total_seconds() > 3600:
                 print(
-                    f"[BG] Periodic Housekeeping: Cleaning up orphaned temp entries older than 6 hours...",
+                    f"[BG] Hourly housekeeping: cleaning orphaned temp entries "
+                    f"older than 6 hours...",
                     flush=True,
                 )
                 bus_tracker.cleanup_old_temp_entries(hours_old=6)
                 last_housekeeping = now
 
-            # --- SESSION-WISE SCAN ---
-            # Fetch ALL sessions that are currently 'active' in the database
+            # ── PHASE 1: active sessions → detect end-of-schedule ────────────
+            # If an active session is outside its scheduled window it transitions
+            # to "ending" (starts the 30-minute grace period).
+            # We do NOT call close_trip_session() directly here so that EXIT logs
+            # arriving after the schedule window still get a chance to be matched.
             active_sessions = list(bus_tracker.trip_sessions.find({"status": "active"}))
-
-            if not active_sessions:
-                continue
 
             for session in active_sessions:
                 bus_id = session.get("bus_id")
                 trip_id = session.get("trip_id")
                 session_start = session.get("start_time")
 
-                if not bus_id or not trip_id:
+                if not bus_id or not trip_id or not session_start:
                     continue
 
-                # 1. Logic: If the session meta-data says it should be over, close it.
-                if schedule_manager:
-                    # Get schedule windows for this specific bus
-                    windows = schedule_manager.get_todays_trip_windows(bus_id)
+                if not schedule_manager:
+                    # No schedule manager configured — skip automatic ending.
+                    continue
 
-                    is_active_time = False
-                    if not windows:
-                        # No windows at all for this bus today?
-                        # If session started more than 30 mins ago, it's likely a stale leftover from yesterday.
-                        if (now - session_start).total_seconds() > 1800:
-                            print(
-                                f"[BG] Session {trip_id} has no valid windows today. Closing stale session.",
-                                flush=True,
-                            )
-                            bus_tracker.close_trip_session(bus_id, trip_id)
-                        continue
+                windows = schedule_manager.get_todays_trip_windows(bus_id)
 
-                    # Check if current time falls into any scheduled window
-                    for window in windows:
-                        if bus_tracker.is_within_trip_schedule(
-                            current_hhmm, window["start_time"], window["end_time"]
-                        ):
-                            is_active_time = True
-                            break
+                if not windows:
+                    # No windows defined for this bus today.
+                    # If the session has been running for more than TRIP_END_GRACE_MINUTES
+                    # it is likely a stale leftover from yesterday → start grace period.
+                    age_seconds = (now_utc - session_start).total_seconds()
+                    if age_seconds > TRIP_END_GRACE_MINUTES * 60:
+                        print(
+                            f"[BG] Session {trip_id} ({bus_id}): no schedule windows "
+                            f"today and running for {age_seconds / 60:.0f} min. "
+                            f"Starting {TRIP_END_GRACE_MINUTES}-min grace period.",
+                            flush=True,
+                        )
+                        bus_tracker.mark_trip_ending(bus_id, trip_id)
+                    continue
 
-                    # 2. If it's NOT active time, and the session has been running for at least 15 mins
-                    if not is_active_time:
-                        if (now - session_start).total_seconds() > 900:
-                            print(
-                                f"[BG] Session {trip_id} is outside scheduled windows. Closing.",
-                                flush=True,
-                            )
-                            bus_tracker.close_trip_session(bus_id, trip_id)
+                # Check whether current time falls inside any scheduled window.
+                is_active_time = False
+                for window in windows:
+                    if bus_tracker.is_within_trip_schedule(
+                        current_hhmm, window["start_time"], window["end_time"]
+                    ):
+                        is_active_time = True
+                        break
+
+                if not is_active_time:
+                    # Must have been running for at least 15 min before we act
+                    # (guards against false triggers at the very start of a session).
+                    age_seconds = (now_utc - session_start).total_seconds()
+                    if age_seconds > 900:
+                        print(
+                            f"[BG] Session {trip_id} ({bus_id}): outside scheduled "
+                            f"window. Starting {TRIP_END_GRACE_MINUTES}-min grace period.",
+                            flush=True,
+                        )
+                        bus_tracker.mark_trip_ending(bus_id, trip_id)
+
+            # ── PHASE 2: ending sessions → wait for grace period, then close ─
+            # When TRIP_END_GRACE_MINUTES have elapsed since end_detected_at,
+            # call close_trip_session() which:
+            #   1. Moves all remaining temp_entries for THIS trip → unmatchedPassengers
+            #   2. Marks the trip as "completed"
+            ending_sessions = list(bus_tracker.trip_sessions.find({"status": "ending"}))
+
+            for session in ending_sessions:
+                bus_id = session.get("bus_id")
+                trip_id = session.get("trip_id")
+                end_detected_at = session.get("end_detected_at")
+
+                if not bus_id or not trip_id or not end_detected_at:
+                    # Safety: if end_detected_at is missing, close it now.
+                    if bus_id and trip_id:
+                        print(
+                            f"[BG] Session {trip_id} ({bus_id}): missing "
+                            f"end_detected_at — closing immediately.",
+                            flush=True,
+                        )
+                        bus_tracker.close_trip_session(bus_id, trip_id)
+                    continue
+
+                grace_elapsed_seconds = (now_utc - end_detected_at).total_seconds()
+                grace_elapsed_minutes = grace_elapsed_seconds / 60.0
+                remaining_minutes = TRIP_END_GRACE_MINUTES - grace_elapsed_minutes
+
+                if grace_elapsed_seconds >= TRIP_END_GRACE_MINUTES * 60:
+                    print(
+                        f"[BG] Session {trip_id} ({bus_id}): grace period elapsed "
+                        f"({grace_elapsed_minutes:.1f} min). "
+                        f"Moving unmatched temp_entries → unmatchedPassengers...",
+                        flush=True,
+                    )
+                    bus_tracker.close_trip_session(bus_id, trip_id)
+                else:
+                    print(
+                        f"[BG] Session {trip_id} ({bus_id}): in grace period — "
+                        f"auto-close in {remaining_minutes:.1f} min.",
+                        flush=True,
+                    )
 
         except Exception as e:
-            print(f"[BG] Error in session-wise monitor: {e}", flush=True)
-
-        except Exception as e:
-            print(f"[BG] Error in background monitor: {e}", flush=True)
-            # Don't crash the thread
+            print(f"[BG] Error in trip lifecycle monitor: {e}", flush=True)
+            # Don't crash the thread — log and continue to next iteration.
 
 
 def run_server(port=None):
