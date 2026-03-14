@@ -55,6 +55,42 @@ class FaceEngine:
             except Exception as e:
                 print(f"[ERR] Failed to initialize ONNX engine: {e}")
 
+    def align_face_landmarks(self, image_rgb, face_data):
+        """
+        Landmark-based 5-point similarity alignment to 112x112.
+        Matches ESP32 face_recognition_tool::align_face() behaviour.
+        YuNet outputs 5 keypoints: [left_eye, right_eye, nose, left_mouth, right_mouth]
+        each as (x, y) packed in face_data[4:14].
+        """
+        # Standard template for 112x112 (ArcFace / MobileFaceNet canonical positions)
+        REFERENCE_LANDMARKS = np.array([
+            [38.2946, 51.6963],  # left  eye
+            [73.5318, 51.5014],  # right eye
+            [56.0252, 71.7366],  # nose tip
+            [41.5493, 92.3655],  # left  mouth corner
+            [70.7299, 92.2041],  # right mouth corner
+        ], dtype=np.float32)
+
+        try:
+            # YuNet face_data layout: [x, y, w, h, conf, lm0x, lm0y, lm1x, lm1y, ... lm4x, lm4y]
+            kps = face_data[4:14].reshape(5, 2).astype(np.float32)
+        except Exception:
+            # Fallback to simple crop if landmarks are not available
+            return self.crop_face(image_rgb, face_data)
+
+        # Estimate affine transform from 5 keypoints → reference positions
+        try:
+            tform, _ = cv2.estimateAffinePartial2D(
+                kps, REFERENCE_LANDMARKS,
+                method=cv2.LMEDS
+            )
+            if tform is None:
+                return self.crop_face(image_rgb, face_data)
+            aligned = cv2.warpAffine(image_rgb, tform, (112, 112), flags=cv2.INTER_LINEAR)
+            return aligned
+        except Exception:
+            return self.crop_face(image_rgb, face_data)
+
     def extract_embedding(self, image_bgr):
         if not self.initialized:
             return None, "Engine not initialized"
@@ -72,12 +108,16 @@ class FaceEngine:
             # Use the first face (the most confident one)
             face = faces[0]
             
-            # 2. Align and crop to 112x112 (Standard for MobileFaceNet/ESP32)
-            # ESP32 models like MobileFaceNet expect 112x112 input
-            face_align = self.crop_face(image_bgr, face)
+            # CRITICAL FIX: Convert BGR to RGB to match ESP32 color space
+            # ESP32 uses RGB format, OpenCV uses BGR by default
+            # This mismatch was causing embeddings to not match even for the same person
+            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            
+            # 2. Landmark-aligned crop to 112x112 (matches ESP32 face_recognition_tool::align_face)
+            face_align = self.align_face_landmarks(image_rgb, face)
             
             # 3. Preprocess for MobileFaceNet
-            # Normalization typically: (x - 127.5) / 128.0
+            # Normalization: (x - 127.5) / 128.0 — matches ESP32 MobileFaceNet preprocessing
             blob = cv2.resize(face_align, (112, 112))
             blob = blob.astype(np.float32)
             blob = (blob - 127.5) / 128.0
@@ -88,7 +128,7 @@ class FaceEngine:
             input_name = self.recognizer.get_inputs()[0].name
             embedding = self.recognizer.run(None, {input_name: blob})[0]
             
-            # Normalize embedding (L2 Norm) to match ESP32 behavior
+            # 5. L2-Normalize embedding to match ESP32 behavior
             norm = np.linalg.norm(embedding)
             if norm > 1e-6:
                 embedding = embedding / norm
@@ -99,7 +139,7 @@ class FaceEngine:
             return None, f"Extraction error: {str(e)}"
 
     def crop_face(self, image, face_data):
-        """Simple crop based on YuNet bbox. In production, use landmarks for alignment."""
+        """Simple bbox crop with margin (fallback when landmarks unavailable)."""
         x, y, w, h = face_data[:4].astype(int)
         # Add some margin
         margin = 0.2
