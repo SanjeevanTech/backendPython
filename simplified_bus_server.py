@@ -114,8 +114,10 @@ class SimplifiedBusTracker:
         # Firmware applies brightness normalization (mean→128) on the 112x112 aligned face crop
         # BEFORE the model runs — this removes AWB/AEC settling differences between the two cameras.
         # After normalization: cross-device same-person similarity ~0.65-0.80 (was ~0.50-0.57).
-        # 0.60 is the correct threshold: catches cross-device matches, rejects strangers (< 0.35).
-        self.similarity_threshold = 0.60
+        # 0.55 is used instead of 0.60 to catch real-world near-misses (e.g. 0.584) caused by
+        # slight angle/lighting differences between the entrance and exit cameras.
+        # Strangers consistently score < 0.35, so the 0.20 gap to 0.55 is a safe margin.
+        self.similarity_threshold = 0.55
         self.season_ticket_similarity_threshold = (
             0.60  # Season ticket: same camera, higher confidence needed
         )
@@ -2081,12 +2083,18 @@ class SimplifiedBusTracker:
             current_trip = self.get_current_trip_for_bus(bus_id)
 
             # Determine trip details (with fallback)
-            if current_trip and current_trip.get("status") == "active":
+            # Accept both "active" and "ending" (grace-period) trips.
+            # Previously only "active" was accepted, which caused unmatched exits that
+            # arrived during the 30-minute grace window to be stored with a FALLBACK
+            # trip ID — even though find_matching_entry() had already located the real
+            # trip.  The "ending" status is set by mark_trip_ending() and means the
+            # trip has finished its scheduled window but exits are still being accepted.
+            if current_trip and current_trip.get("status") in ("active", "ending"):
                 trip_id = current_trip["trip_id"]
                 trip_start_time = current_trip["start_time"]
             else:
                 print(
-                    f"[WARN] No active trip for {bus_id} - storing unmatched exit with FALLBACK trip",
+                    f"[WARN] No active/ending trip for {bus_id} - storing unmatched exit with FALLBACK trip",
                     flush=True,
                 )
                 trip_id = f"FALLBACK_{bus_id}_{datetime.now().strftime('%Y%m%d_%H%M')}"
@@ -2573,7 +2581,10 @@ class SimplifiedHandler(BaseHTTPRequestHandler):
             parsed_path = urlparse(self.path)
 
             # ESP32 Face Embedding Extraction Endpoint
-            if parsed_path.path in ("/api/extract-face-embedding", "/api/python/api/extract-face-embedding"):
+            if parsed_path.path in (
+                "/api/extract-face-embedding",
+                "/api/python/api/extract-face-embedding",
+            ):
                 content_length = int(self.headers.get("Content-Length", 0))
                 print(
                     f"[PHOTO] Incoming face photo: {content_length / 1024:.1f} KB",
