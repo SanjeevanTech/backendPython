@@ -339,15 +339,15 @@ class SimplifiedBusTracker:
                             "trip_id": trip_id,
                             "bus_id": bus_id,
                             "route_name": entry.get("route_name", self.route_name),
-                            "type": "ENTRY",
+                            "type": entry.get("type", "ENTRY"),
                             "trip_start_time": start_time,
                             "face_id": entry.get("face_id", 0),
                             "face_embedding": entry.get("face_embedding", []),
                             "embedding_size": entry.get("embedding_size", 0),
-                            "location": entry.get("entry_location", {}),
-                            "timestamp": entry.get("entry_timestamp"),
-                            "best_similarity_found": 0.0,
-                            "reason": "Auto-closed stale trip",
+                            "location": entry.get("location") or entry.get("entry_location", {}),
+                            "timestamp": entry.get("timestamp") or entry.get("entry_timestamp"),
+                            "best_similarity_found": entry.get("best_similarity_found", 0.0),
+                            "reason": entry.get("reason", "Auto-closed stale trip"),
                             "created_at": datetime.now(),
                         }
                         self.unmatched_passengers.insert_one(unmatched_entry)
@@ -406,15 +406,21 @@ class SimplifiedBusTracker:
             if start_time is None:
                 start_time = datetime.utcnow()
 
-            # End previous trip for this bus if exists
+            # End previous trip for this bus if exists.
+            # end_current_trip() now calls mark_trip_ending() (starts grace window)
+            # instead of close_trip_session() (immediate sweep), so passengers who
+            # are still on board have TRIP_END_GRACE_MINUTES to exit and be matched.
             if (
                 bus_id in self.current_trips
                 and self.current_trips[bus_id].get("status") == "active"
             ):
                 self.end_current_trip(bus_id=bus_id)
 
-            # Cleanup orphaned entries for this bus
-            self.cleanup_old_temp_entries(hours_old=0, bus_id=bus_id)
+            # DO NOT call cleanup_old_temp_entries(hours_old=0) here.
+            # That call deleted ALL entries for this bus_id regardless of trip_id,
+            # wiping out any entries from the just-ended (now grace-period) trip
+            # before passengers had a chance to exit.  The hourly housekeeping in
+            # run_background_checks() handles genuinely orphaned entries (> 6 h old).
 
             # Generate trip ID
             trip_id = self.generate_trip_id(start_time, bus_id)
@@ -465,7 +471,20 @@ class SimplifiedBusTracker:
             return None
 
     def end_current_trip(self, bus_id=None):
-        """Wrapper to end the currently tracked trip for a bus"""
+        """
+        Transition the current trip into the 60-minute grace window.
+
+        Previously this called close_trip_session() directly, which swept ALL
+        remaining temp_entries to unmatchedPassengers IMMEDIATELY — before any
+        passengers had a chance to exit and be matched.  This violated the
+        user requirement: entries should only be moved to unmatched AFTER the
+        trip ends AND the grace period (TRIP_END_GRACE_MINUTES) has elapsed.
+
+        The background thread (run_background_checks) will call
+        close_trip_session() once TRIP_END_GRACE_MINUTES have elapsed from
+        end_detected_at, satisfying the "same trip_id, same bus_id, after grace
+        period" requirement.
+        """
         if bus_id is None:
             bus_id = self.default_bus_id
 
@@ -474,7 +493,23 @@ class SimplifiedBusTracker:
             print(f"[ERROR] No active trip in memory for {bus_id}", flush=True)
             return False
 
-        return self.close_trip_session(bus_id, current_trip["trip_id"])
+        trip_id = current_trip["trip_id"]
+
+        # Only transition active trips — if already ending/completed, skip.
+        if current_trip.get("status") != "active":
+            print(
+                f"[WARN] end_current_trip: trip {trip_id} is already "
+                f"'{current_trip.get('status')}' — skipping.",
+                flush=True,
+            )
+            return False
+
+        print(
+            f"[BUS] Ending trip {trip_id} for {bus_id}: starting "
+            f"{TRIP_END_GRACE_MINUTES}-min grace period (entries preserved).",
+            flush=True,
+        )
+        return self.mark_trip_ending(bus_id, trip_id)
 
     def close_trip_session(self, bus_id, trip_id):
         """
@@ -515,15 +550,15 @@ class SimplifiedBusTracker:
                     "trip_id": trip_id,
                     "bus_id": bus_id,
                     "route_name": entry.get("route_name", self.route_name),
-                    "type": "ENTRY",
+                    "type": entry.get("type", "ENTRY"),
                     "trip_start_time": session.get("start_time"),
                     "face_id": entry.get("face_id", 0),
                     "face_embedding": entry.get("face_embedding", []),
                     "embedding_size": entry.get("embedding_size", 0),
-                    "location": entry.get("entry_location", {}),
-                    "timestamp": entry.get("entry_timestamp"),
-                    "best_similarity_found": 0.0,
-                    "reason": "Session ended automatically",
+                    "location": entry.get("location") or entry.get("entry_location", {}),
+                    "timestamp": entry.get("timestamp") or entry.get("entry_timestamp"),
+                    "best_similarity_found": entry.get("best_similarity_found", 0.0),
+                    "reason": entry.get("reason", "Session ended automatically"),
                     "created_at": datetime.now(),
                 }
                 self.unmatched_passengers.insert_one(unmatched_entry)
@@ -1539,8 +1574,51 @@ class SimplifiedBusTracker:
             )
 
             entries_list = list(unmatched_entries)
+
+            # ── Also check entries from any ENDING (grace-period) trips ──────
+            # Scenario: Trip A ends → end_current_trip() calls mark_trip_ending()
+            # which starts the grace window → start_new_trip() creates Trip B
+            # (now active in current_trips).  An EXIT arriving while Trip A is
+            # still in its grace period belongs to a passenger who boarded under
+            # Trip A.  Without this extra query the exit would fail with
+            # "No unmatched entries found" because the current trip is Trip B and
+            # the query filters by trip_id = Trip B.
+            ending_trips_for_bus = list(
+                self.trip_sessions.find(
+                    {
+                        "bus_id": bus_id,
+                        "status": "ending",
+                        "trip_id": {"$ne": current_trip["trip_id"]},
+                    }
+                )
+            )
+            for ending_sess in ending_trips_for_bus:
+                ending_q = {
+                    "trip_id": ending_sess["trip_id"],
+                    "bus_id": bus_id,
+                    "entry_timestamp": {"$gte": time_threshold},
+                    "face_embedding": {"$exists": True, "$ne": []},
+                }
+                extra_entries = list(
+                    self.temp_entries.find(ending_q).sort("entry_timestamp", -1)
+                )
+                if extra_entries:
+                    print(
+                        f"[SEARCH] Also checking {len(extra_entries)} entries from "
+                        f"ending trip {ending_sess['trip_id']} (overlap grace window)",
+                        flush=True,
+                    )
+                    entries_list.extend(extra_entries)
+
             print(
-                f"[SEARCH] Found {len(entries_list)} entries for {bus_id} (Trip: {current_trip['trip_id']})",
+                f"[SEARCH] Found {len(entries_list)} entries for {bus_id} "
+                f"(Trip: {current_trip['trip_id']}"
+                + (
+                    f" + {len(ending_trips_for_bus)} ending trip(s)"
+                    if ending_trips_for_bus
+                    else ""
+                )
+                + ")",
                 flush=True,
             )
 
@@ -2124,7 +2202,7 @@ class SimplifiedBusTracker:
                 "timestamp": self._parse_timestamp_safe(exit_log.get("timestamp")),
                 "best_similarity_found": float(best_similarity),
                 "reason": "No matching entry found",
-                "created_at": datetime.utcnow(),
+                "created_at": datetime.now(),
             }
 
             result = self.unmatched_passengers.insert_one(unmatched_exit)
@@ -2153,8 +2231,18 @@ class SimplifiedBusTracker:
             if hours_old > 0:
                 # Time-based cleanup - clean entries older than hours_old
                 cutoff_time = datetime.now() - timedelta(hours=hours_old)
-                query["entry_timestamp"] = {"$lt": cutoff_time}
+                query["$or"] = [
+                    {"entry_timestamp": {"$lt": cutoff_time}},
+                    {"timestamp": {"$lt": cutoff_time}}
+                ]
                 reason = f"No exit found within {hours_old} hours"
+                
+                # Exclude active/ending trips since user requirement states:
+                # "only that same bus id and trip id datas are move unmatch when that trip is end"
+                active_trips = list(self.trip_sessions.find({"status": {"$in": ["active", "ending"]}}))
+                if active_trips:
+                    active_trip_ids = [t["trip_id"] for t in active_trips]
+                    query["trip_id"] = {"$nin": active_trip_ids}
             else:
                 # Trip end cleanup - clean ALL remaining entries for this bus/trip
                 reason = "Trip ended - no exit match found"
@@ -2183,20 +2271,20 @@ class SimplifiedBusTracker:
                         "trip_id": entry.get("trip_id", "UNKNOWN"),
                         "bus_id": entry_bus_id,
                         "route_name": entry.get("route_name", self.route_name),
-                        "type": "ENTRY",
+                        "type": entry.get("type", "ENTRY"),
                         "trip_start_time": entry.get("trip_start_time"),
                         "face_id": entry.get("face_id", 0),
                         "face_embedding": entry.get("face_embedding", []),
                         "embedding_size": entry.get("embedding_size", 0),
-                        "location": entry.get("entry_location", {}),
-                        "timestamp": entry.get("entry_timestamp"),
-                        "best_similarity_found": 0.0,
+                        "location": entry.get("location") or entry.get("entry_location", {}),
+                        "timestamp": entry.get("timestamp") or entry.get("entry_timestamp"),
+                        "best_similarity_found": entry.get("best_similarity_found", 0.0),
                         "reason": reason,
                         "created_at": datetime.now(),
                     }
                     self.unmatched_passengers.insert_one(unmatched_entry)
                     print(
-                        f"   -> Moved ENTRY face_id={entry.get('face_id')} to unmatchedPassengers",
+                        f"   -> Moved {entry.get('type', 'ENTRY')} face_id={entry.get('face_id')} to unmatchedPassengers",
                         flush=True,
                     )
 
