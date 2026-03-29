@@ -1055,74 +1055,88 @@ class SimplifiedBusTracker:
                 flush=True,
             )
 
-            # NOTE: ESP32 embeddings from ESP-WHO are already L2-normalised by
-            # transform_mfn_output(norm=true) inside enroll_id()/recognize().
-            # Re-normalising here is a no-op for cosine similarity (sklearn
-            # divides by norms internally) but creates a subtle inconsistency
-            # versus find_matching_entry() which deliberately skips it.
-            # Keep the array construction only.
+            # Convert input embedding to numpy array
             input_array = np.array(face_embedding, dtype=np.float32).reshape(1, -1)
-            print(f"[STATS] Input embedding size: {input_array.shape}", flush=True)
+            
+            # CRITICAL FIX: Normalize the input embedding
+            # ESP32 embeddings are sometimes not properly normalized (norm ~0.5 instead of 1.0)
+            # This causes cosine similarity to fail. Always normalize before comparison.
+            input_norm = np.linalg.norm(input_array)
+            if input_norm > 0.01:  # Avoid division by zero
+                input_array = input_array / input_norm
+                print(f"[STATS] Input embedding normalized: {input_array.shape}, norm was {input_norm:.6f}, now 1.0", flush=True)
+            else:
+                print(f"[WARN] Input embedding has near-zero norm ({input_norm:.6f}), skipping normalization", flush=True)
 
             best_match = None
             best_similarity = 0.0
             all_similarities = []
 
             for member in all_active_members:
-                if not member.get("face_embedding"):
-                    continue
-
                 member_name = member.get("name", "Unknown")
                 member_id = member.get("member_id", "Unknown")
 
-                # Convert member embedding to numpy array
-                member_embedding = member["face_embedding"]
+                # Build list of all stored embeddings for this member.
+                # face_embeddings = new multi-lighting array (up to 5).
+                # face_embedding  = legacy single embedding (backward compat).
+                stored_embeddings = member.get("face_embeddings") or []
+                single = member.get("face_embedding")
+                if single and not stored_embeddings:
+                    stored_embeddings = [single]
 
-                # DIMENSIONALITY CHECK: Skip if dimensions don't match input
-                if len(member_embedding) != input_array.shape[1]:
-                    print(
-                        f"   [SKIP] {member_name} ({member_id}): Dimension mismatch ({len(member_embedding)} vs {input_array.shape[1]})",
-                        flush=True,
-                    )
+                if not stored_embeddings:
                     continue
 
-                member_array = np.array(member_embedding, dtype=np.float32).reshape(
-                    1, -1
+                # Compare against ALL stored embeddings — best score wins.
+                best_sim_for_member = 0.0
+                for idx, stored_emb in enumerate(stored_embeddings):
+                    if not stored_emb:
+                        print(f"   [ERR] Stored embedding {idx} for {member_name} is empty!", flush=True)
+                        continue
+                        
+                    input_dim = input_array.shape[1]
+                    stored_dim = len(stored_emb)
+                    
+                    if stored_dim != input_dim:
+                        print(
+                            f"   [SKIP] Emb {idx} for {member_name}: Dimension mismatch ({stored_dim} vs {input_dim})",
+                            flush=True,
+                        )
+                        continue
+                        
+                    try:
+                        member_array = np.array(stored_emb, dtype=np.float32).reshape(1, -1)
+                        
+                        # DEBUG: Log embedding statistics
+                        input_norm = float(np.linalg.norm(input_array))
+                        member_norm = float(np.linalg.norm(member_array))
+                        print(f"   [DEBUG] Input embedding: norm={input_norm:.6f}, first 5={input_array[0][:5]}", flush=True)
+                        print(f"   [DEBUG] Stored embedding: norm={member_norm:.6f}, first 5={member_array[0][:5]}", flush=True)
+                        
+                        sim = cosine_similarity(input_array, member_array)[0][0]
+                        print(f"   - Match ({idx}) vs {member_name}: {sim:.4f}", flush=True)
+                        if sim > best_sim_for_member:
+                            best_sim_for_member = sim
+                    except Exception as sim_err:
+                        print(f"   [ERR] Sim calc error for {member_name} (idx {idx}): {sim_err}", flush=True)
+                        import traceback
+                        traceback.print_exc()
+                        continue
+
+                similarity = best_sim_for_member
+                all_similarities.append((member_name, member_id, similarity))
+
+                print(
+                    f"   - {member_name} ({member_id}): final_best={similarity:.4f} "
+                    f"across {len(stored_embeddings)} embedding(s) "
+                    f"(threshold: {self.season_ticket_similarity_threshold})",
+                    flush=True,
                 )
-                # NOTE: Stored member embeddings are also ESP32-sourced and
-                # already L2-normalised; sklearn cosine_similarity handles
-                # normalisation internally, so no explicit re-normalisation needed.
 
-                # Calculate cosine similarity
-                try:
-                    similarity = cosine_similarity(input_array, member_array)[0][0]
-                    all_similarities.append((member_name, member_id, similarity))
-
-                    print(
-                        f"   - {member_name} ({member_id}): similarity = {similarity:.4f} (threshold: {self.season_ticket_similarity_threshold})",
-                        flush=True,
-                    )
-
-                    # NOTE: AUTO-SYNC REMOVED — it was unsafe.
-                    # The old logic updated a member's stored embedding with ANY incoming
-                    # face that had a dimension mismatch (needs_hardware_sync=True OR
-                    # embedding_size differs).  Because the check fires when similarity is
-                    # BELOW the threshold (i.e. the face does NOT match), a complete
-                    # stranger could have overwritten a legitimate member's profile and
-                    # been granted a free ride at similarity=1.0.
-                    # Use the dedicated /api/register-season-ticket endpoint to update
-                    # member embeddings deliberately.
-
-                    if similarity > best_similarity:
-                        best_similarity = similarity
-                        if similarity > self.season_ticket_similarity_threshold:
-                            best_match = member
-                except Exception as sim_err:
-                    print(
-                        f"   [ERR] Similarity calculation failed for {member_name}: {sim_err}",
-                        flush=True,
-                    )
-                    continue
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    if similarity > self.season_ticket_similarity_threshold:
+                        best_match = member
 
             # Print summary
             print(f"\n[OK] Season Ticket Check Summary:", flush=True)
@@ -1215,6 +1229,16 @@ class SimplifiedBusTracker:
             # internally) and inconsistent with find_matching_entry() which deliberately
             # skips it.  Keep only the array construction.
             input_array = np.array(face_embedding, dtype=np.float32).reshape(1, -1)
+            
+            # CRITICAL FIX: Normalize the input embedding
+            # ESP32 embeddings are sometimes not properly normalized (norm ~0.5 instead of 1.0)
+            # This causes cosine similarity to fail. Always normalize before comparison.
+            input_norm = np.linalg.norm(input_array)
+            if input_norm > 0.01:  # Avoid division by zero
+                input_array = input_array / input_norm
+                print(f"[STATS] Input embedding normalized for contractor check: norm was {input_norm:.6f}, now 1.0", flush=True)
+            else:
+                print(f"[WARN] Input embedding has near-zero norm ({input_norm:.6f}), skipping normalization", flush=True)
 
             best_similarity = 0.0
             best_contractor = None
@@ -1225,34 +1249,58 @@ class SimplifiedBusTracker:
             )
 
             for contractor in contractors:
-                if not contractor.get("face_embedding"):
+                # Build a list of all stored embeddings for this contractor.
+                # face_embeddings is the new multi-lighting array (up to 5).
+                # face_embedding is the legacy single embedding (backward compat).
+                stored_embeddings = contractor.get("face_embeddings") or []
+                single = contractor.get("face_embedding")
+                if single and not stored_embeddings:
+                    stored_embeddings = [single]  # legacy fallback
+
+                if not stored_embeddings:
                     continue
 
-                contractor_embedding = contractor["face_embedding"]
+                # Compare against EVERY stored embedding — best score wins.
+                # If ANY lighting condition was captured during registration
+                # that matches current conditions, it will be found here.
+                best_sim_for_this = 0.0
+                for idx, stored_emb in enumerate(stored_embeddings):
+                    if not stored_emb:
+                        print(f"   [ERR] Stored embedding {idx} for {contractor.get('name')} is empty!", flush=True)
+                        continue
+                        
+                    input_dim = input_array.shape[1]
+                    stored_dim = len(stored_emb)
+                    
+                    if stored_dim != input_dim:
+                        print(
+                            f"   [SKIP] Emb {idx} for {contractor.get('name')}: Dimension mismatch ({stored_dim} vs {input_dim})",
+                            flush=True,
+                        )
+                        continue
+                        
+                    stored_array = np.array(stored_emb, dtype=np.float32).reshape(1, -1)
+                    
+                    # DEBUG: Log embedding statistics
+                    input_norm = float(np.linalg.norm(input_array))
+                    stored_norm = float(np.linalg.norm(stored_array))
+                    print(f"   [DEBUG] Input embedding: norm={input_norm:.6f}, first 5={input_array[0][:5]}", flush=True)
+                    print(f"   [DEBUG] Stored embedding: norm={stored_norm:.6f}, first 5={stored_array[0][:5]}", flush=True)
 
-                # Dim Check
-                if len(contractor_embedding) != len(face_embedding):
-                    continue
+                    sim = cosine_similarity(input_array, stored_array)[0][0]
+                    print(f"   - Match ({idx}) vs {contractor.get('name')}: {sim:.4f}", flush=True)
+                    if sim > best_sim_for_this:
+                        best_sim_for_this = sim
 
-                # NOTE: Stored contractor embeddings are ESP32-sourced and already
-                # L2-normalised.  sklearn cosine_similarity normalises internally.
-                contractor_array = np.array(
-                    contractor_embedding, dtype=np.float32
-                ).reshape(1, -1)
+                print(
+                    f"   - Match vs {contractor.get('name')}: final_best={best_sim_for_this:.4f} "
+                    f"across {len(stored_embeddings)} stored embedding(s)",
+                    flush=True,
+                )
 
-                sim = cosine_similarity(input_array, contractor_array)[0][0]
-                print(f"   - Match vs {contractor.get('name')}: {sim:.4f}", flush=True)
-
-                if sim > best_similarity:
-                    best_similarity = sim
+                if best_sim_for_this > best_similarity:
+                    best_similarity = best_sim_for_this
                     best_contractor = contractor
-
-                # NOTE: AUTO-SYNC REMOVED — same security flaw as season ticket sync.
-                # A weak match (0.40–0.70) is by definition NOT a confirmed identity;
-                # overwriting the stored contractor embedding with an unverified face
-                # and then returning similarity=1.0 means ANY stranger with a vaguely
-                # similar face could be registered as a contractor and bypass fare checks.
-                # Update contractor embeddings deliberately via the admin API instead.
 
             # ── Decision: CONFIRMED / SUSPECT / NO-MATCH ─────────────────────
             # CONFIRMED  similarity >= contractor_similarity_threshold (0.60)
@@ -1640,11 +1688,19 @@ class SimplifiedBusTracker:
             )
 
             # Convert exit embedding to numpy array
-            # NOTE: ESP32 embeddings from ESP-WHO are already L2-normalized
-            # Do NOT re-normalize to avoid corrupting the embedding direction
+            # NOTE: ESP32 embeddings from ESP-WHO are sometimes NOT properly L2-normalized
+            # We must normalize both exit and entry embeddings before comparison
             exit_array = np.array(exit_log["face_embedding"], dtype=np.float32).reshape(
                 1, -1
             )
+            
+            # CRITICAL FIX: Normalize the exit embedding
+            exit_norm = np.linalg.norm(exit_array)
+            if exit_norm > 0.01:  # Avoid division by zero
+                exit_array = exit_array / exit_norm
+                print(f"[STATS] Exit embedding normalized: norm was {exit_norm:.6f}, now 1.0", flush=True)
+            else:
+                print(f"[WARN] Exit embedding has near-zero norm ({exit_norm:.6f}), skipping normalization", flush=True)
 
             best_match = None
             best_similarity = 0.0
@@ -1685,9 +1741,17 @@ class SimplifiedBusTracker:
                     continue
 
                 # Convert entry embedding to numpy array
-                # NOTE: ESP32 embeddings from ESP-WHO are already L2-normalized
-                # Do NOT re-normalize to avoid corrupting the embedding direction
+                # NOTE: ESP32 embeddings from ESP-WHO are sometimes NOT properly L2-normalized
+                # We must normalize before comparison
                 entry_array = np.array(entry_embedding, dtype=np.float32).reshape(1, -1)
+                
+                # CRITICAL FIX: Normalize the entry embedding
+                entry_norm = np.linalg.norm(entry_array)
+                if entry_norm > 0.01:  # Avoid division by zero
+                    entry_array = entry_array / entry_norm
+                else:
+                    print(f"  Entry {entry['_id']} [SKIP]: Near-zero norm ({entry_norm:.6f})", flush=True)
+                    continue
 
                 # Calculate cosine similarity
                 try:

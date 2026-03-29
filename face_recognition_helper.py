@@ -72,13 +72,22 @@ class FaceEngine:
         ], dtype=np.float32)
 
         try:
-            # YuNet face_data layout: [x, y, w, h, conf, lm0x, lm0y, lm1x, lm1y, ... lm4x, lm4y]
-            kps = face_data[4:14].reshape(5, 2).astype(np.float32)
+            # YuNet face_data layout: [x, y, w, h, RE_x, RE_y, LE_x, LE_y, NT_x, NT_y, RMC_x, RMC_y, LMC_x, LMC_y, score]
+            # Mapping these to our ArcFace REFERENCE_LANDMARKS (which are: LE, RE, NT, LMC, RMC)
+            kps_raw = face_data[4:14].reshape(5, 2).astype(np.float32)
+            
+            # Reorder from YuNet (RE, LE, NT, RMC, LMC) -> ArcFace (LE, RE, NT, LMC, RMC)
+            kps = np.zeros_like(kps_raw)
+            kps[0] = kps_raw[1] # LE
+            kps[1] = kps_raw[0] # RE
+            kps[2] = kps_raw[2] # NT
+            kps[3] = kps_raw[4] # LMC
+            kps[4] = kps_raw[3] # RMC
         except Exception:
             # Fallback to simple crop if landmarks are not available
             return self.crop_face(image_rgb, face_data)
 
-        # Estimate affine transform from 5 keypoints → reference positions
+        # Estimate affine transform from 5 reordered keypoints → reference positions
         try:
             tform, _ = cv2.estimateAffinePartial2D(
                 kps, REFERENCE_LANDMARKS,
@@ -117,22 +126,45 @@ class FaceEngine:
             face_align = self.align_face_landmarks(image_rgb, face)
             
             # 3. Preprocess for MobileFaceNet
-            # Normalization: (x - 127.5) / 128.0 — matches ESP32 MobileFaceNet preprocessing
             blob = cv2.resize(face_align, (112, 112))
             blob = blob.astype(np.float32)
+
+            # ── CRITICAL: ESP32 Brightness Normalisation ─────────────────────
+            # The ESP32 firmware applies per-image brightness normalization
+            # (mean → 128) to the 112x112 aligned crop BEFORE running the model.
+            # This is the single biggest source of cross-device mismatch.
+            # Without this, a laptop frame under a bright lamp and an ESP32 frame
+            # under bus interior light yield totally different embeddings.
+            mean_val = blob.mean()
+            blob = blob - mean_val + 128.0
+            blob = np.clip(blob, 0, 255)
+
+            # ── Standard MobileFaceNet normalization ──────────────────────────
             blob = (blob - 127.5) / 128.0
-            blob = np.transpose(blob, (2, 0, 1)) # HWC to CHW
+            blob = np.transpose(blob, (2, 0, 1))  # HWC → CHW
             blob = np.expand_dims(blob, axis=0)
-            
-            # 4. Run Inference
+
+            # 4. Run Inference (float32 ONNX model)
             input_name = self.recognizer.get_inputs()[0].name
             embedding = self.recognizer.run(None, {input_name: blob})[0]
-            
-            # 5. L2-Normalize embedding to match ESP32 behavior
+
+            # ── CRITICAL: INT8 Quantization Simulation ───────────────────────
+            # The ESP32 uses the INT8-quantized S8 version of MobileFaceNet.
+            # Quantization clamps and rounds each value to 8-bit integer range
+            # then de-quantizes back.  This simulation makes the laptop embedding
+            # land in the same numeric space as the ESP32 INT8 output, which is
+            # what is stored in MongoDB and compared at matching time.
+            # Scale factor 128 is the typical output scale for INT8 MobileFaceNet.
+            QUANT_SCALE = 128.0
+            embedding_q = np.round(embedding * QUANT_SCALE)
+            embedding_q = np.clip(embedding_q, -128, 127)   # INT8 range
+            embedding = embedding_q / QUANT_SCALE            # de-quantize
+
+            # 5. L2-Normalize to match ESP32 transform_mfn_output() post-step
             norm = np.linalg.norm(embedding)
             if norm > 1e-6:
                 embedding = embedding / norm
-                
+
             return embedding.flatten().tolist(), None
             
         except Exception as e:
